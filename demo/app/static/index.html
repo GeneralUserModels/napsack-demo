@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NAPsack Demo Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- API Key Warning Banner -->
+  <div id="gemini-warning" class="banner banner-warn hidden">
+    ⚠️ <strong>GEMINI_API_KEY not found.</strong>
+    Create a <code>.env</code> file in the project root with
+    <code>GEMINI_API_KEY=your_key_here</code> and restart the server.
+    Steps 2–4 will not work without it.
+  </div>
+
+  <header>
+    <h1>🎬 NAPsack Demo Dashboard</h1>
+    <p class="subtitle">Compare screen-recording captioning methods end-to-end</p>
+  </header>
+
+  <!-- Session Picker -->
+  <section class="card" id="session-card">
+    <h2>📂 Session Directory</h2>
+    <div class="row">
+      <input id="session-dir-input" type="text" placeholder="/path/to/demo_session" />
+      <button class="btn" onclick="loadSession()">Load / Create</button>
+    </div>
+    <p id="session-status" class="status-text"></p>
+  </section>
+
+  <!-- Step 1: Record -->
+  <section class="card step-card" id="step1">
+    <h2>🔴 Step 1 – Record</h2>
+    <p>Starts both the <strong>pack</strong> event-driven recorder and the
+       <strong>FFmpeg</strong> continuous video recorder in parallel.</p>
+    <div class="row">
+      <label>Max Resolution:
+        <input id="max-res-w" type="number" value="1920" style="width:70px"/>
+        ×
+        <input id="max-res-h" type="number" value="1080" style="width:70px"/>
+      </label>
+      <button class="btn btn-red" id="record-btn" onclick="toggleRecording()">▶ Start Recording</button>
+    </div>
+    <p id="record-status" class="status-text"></p>
+  </section>
+
+  <!-- Step 2: Process -->
+  <section class="card step-card" id="step2">
+    <h2>⚙️ Step 2 – Generate Captions</h2>
+    <p>Run the four captioning methods. Each writes captions to the session directory.</p>
+    <div class="method-grid">
+      <div class="method-row" id="method-naive">
+        <div class="method-label">
+          <strong>naive</strong>
+          <span class="method-desc">Whole-video Gemini captioning (no split, ffmpeg video)</span>
+        </div>
+        <div class="method-status" id="status-naive">pending</div>
+        <div class="method-size" id="size-naive">–</div>
+        <button class="btn btn-sm" onclick="runMethod('naive')">Run</button>
+      </div>
+      <div class="method-row" id="method-split">
+        <div class="method-label">
+          <strong>+ split</strong>
+          <span class="method-desc">Split into 1-min chunks first, then label</span>
+        </div>
+        <div class="method-status" id="status-split">pending</div>
+        <div class="method-size" id="size-split">–</div>
+        <button class="btn btn-sm" onclick="runMethod('split')">Run</button>
+      </div>
+      <div class="method-row" id="method-split_compress">
+        <div class="method-label">
+          <strong>+ split + compress</strong>
+          <span class="method-desc">Pack screenshots (event-driven) → 1-min chunks → label</span>
+        </div>
+        <div class="method-status" id="status-split_compress">pending</div>
+        <div class="method-size" id="size-split_compress">–</div>
+        <button class="btn btn-sm" onclick="runMethod('split_compress')">Run</button>
+      </div>
+      <div class="method-row" id="method-split_compress_io">
+        <div class="method-label">
+          <strong>+ split + compress + IO</strong>
+          <span class="method-desc">Full pack (screenshots + events) → fused with video captions</span>
+        </div>
+        <div class="method-status" id="status-split_compress_io">pending</div>
+        <div class="method-size" id="size-split_compress_io">–</div>
+        <button class="btn btn-sm" onclick="runMethod('split_compress_io')">Run</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Step 3: GT Annotation -->
+  <section class="card step-card" id="step3">
+    <h2>✏️ Step 3 – Annotate Ground-Truth Captions</h2>
+    <p>Review the <em>split + compress + IO</em> captions (8 at a time) and correct them to produce GT captions.
+       Use arrow keys / buttons to navigate frames. Edit, delete, or add captions inline.</p>
+    <button class="btn" onclick="loadGT()">Load Captions for Annotation</button>
+
+    <div id="gt-nav" class="hidden">
+      <div class="gt-chunk-nav">
+        <button class="btn btn-sm" onclick="prevGTChunk()">← Prev Chunk</button>
+        <span id="gt-chunk-indicator">Chunk 1 / ?</span>
+        <button class="btn btn-sm" onclick="nextGTChunk()">Next Chunk →</button>
+      </div>
+
+      <!-- Frame viewer -->
+      <div class="frame-viewer">
+        <button class="btn btn-sm" onclick="prevFrame()">◀</button>
+        <div class="frame-container">
+          <img id="frame-img" src="" alt="frame" />
+          <p id="frame-caption-label" class="frame-label"></p>
+        </div>
+        <button class="btn btn-sm" onclick="nextFrame()">▶</button>
+      </div>
+
+      <!-- GT video clip -->
+      <div id="gt-video-container" class="hidden">
+        <p><strong>GT video clip for this chunk:</strong></p>
+        <video id="gt-video" controls style="max-width:100%;border-radius:6px;"></video>
+      </div>
+
+      <!-- Caption editor -->
+      <div id="caption-editor"></div>
+
+      <div class="row" style="margin-top:12px">
+        <button class="btn" onclick="addCaption()">+ Add Caption</button>
+        <button class="btn btn-green" onclick="saveGT()">💾 Save GT Captions</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Step 4: LLM Judge -->
+  <section class="card step-card" id="step4">
+    <h2>🤖 Step 4 – LLM Judge</h2>
+    <p>Run the LLM judge comparing all four methods against GT captions (3 independent runs, bootstrap SE).</p>
+    <div class="row">
+      <label>Runs: <input id="judge-runs" type="number" value="3" min="1" max="10" style="width:60px"/></label>
+      <button class="btn" onclick="runJudge()">▶ Run Judge</button>
+    </div>
+    <p id="judge-status" class="status-text"></p>
+  </section>
+
+  <!-- Step 5: Human Evaluation -->
+  <section class="card step-card" id="step5">
+    <h2>👤 Step 5 – Human Evaluation</h2>
+    <p>Rank the four method outputs (blinded) for each GT chunk. Then compute Pearson r / Spearman ρ vs LLM scores.</p>
+    <button class="btn" onclick="loadHumanChunks()">Load Chunks for Ranking</button>
+
+    <div id="human-eval-ui" class="hidden">
+      <div class="gt-chunk-nav">
+        <button class="btn btn-sm" onclick="prevHumanChunk()">← Prev</button>
+        <span id="human-chunk-indicator">Chunk 1 / ?</span>
+        <button class="btn btn-sm" onclick="nextHumanChunk()">Next →</button>
+      </div>
+
+      <!-- GT clip for human eval -->
+      <div id="human-gt-video-container" class="hidden" style="margin-bottom:12px">
+        <p><strong>GT video clip:</strong></p>
+        <video id="human-gt-video" controls style="max-width:100%;border-radius:6px;"></video>
+      </div>
+
+      <div class="human-split">
+        <div class="human-gt">
+          <h4>Ground Truth</h4>
+          <div id="human-gt-captions" class="caption-list"></div>
+        </div>
+        <div class="human-candidates" id="human-candidates-panel"></div>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <button class="btn btn-green" onclick="submitRanking()">✓ Submit Ranking for this Chunk</button>
+      </div>
+      <p id="human-status" class="status-text"></p>
+    </div>
+
+    <div style="margin-top:16px">
+      <button class="btn" onclick="finalizeHuman()">📊 Compute Correlations</button>
+    </div>
+  </section>
+
+  <!-- Results Dashboard -->
+  <section class="card" id="results-card">
+    <h2>📊 Results</h2>
+    <button class="btn btn-sm" onclick="loadResults()">Refresh</button>
+
+    <div id="results-table-container" class="hidden" style="margin-top:16px">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>Method</th>
+            <th>Judge Score (↑)</th>
+            <th>Size (↓)</th>
+          </tr>
+        </thead>
+        <tbody id="results-tbody"></tbody>
+      </table>
+    </div>
+
+    <div id="correlation-container" class="hidden" style="margin-top:16px">
+      <h3>Human vs LLM Correlation</h3>
+      <table id="corr-table">
+        <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+        <tbody id="corr-tbody"></tbody>
+      </table>
+    </div>
+
+    <div id="latex-container" class="hidden" style="margin-top:16px">
+      <h3>LaTeX Table</h3>
+      <pre id="latex-output" class="latex-pre"></pre>
+      <button class="btn btn-sm" onclick="copyLatex()">📋 Copy</button>
+    </div>
+  </section>
+
+  <!-- Log Console -->
+  <section class="card" id="log-card">
+    <h2>📋 Live Log</h2>
+    <div id="log-console" class="log-console"></div>
+    <button class="btn btn-sm" onclick="clearLog()">Clear</button>
+  </section>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

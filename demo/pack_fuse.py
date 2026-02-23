@@ -138,6 +138,20 @@ class CaptionLoader:
             chunks.append(self._load_jsonl(chunk_file))
         return chunks
 
+    def load_from_chunks(self, name: str) -> List[List[Dict]]:
+        """Load pack captions from chunk_NNN/captions.jsonl (label pipeline output format)."""
+        base = Path(name)
+        chunks = []
+        for chunk_dir in sorted(base.glob("chunk_????")):
+            cap_file = chunk_dir / "captions.jsonl"
+            chunks.append(self._load_jsonl(cap_file))
+        # Also try chunk_NNN (3-digit) naming
+        if not chunks:
+            for chunk_dir in sorted(base.glob("chunk_???")):
+                cap_file = chunk_dir / "captions.jsonl"
+                chunks.append(self._load_jsonl(cap_file))
+        return chunks
+
     def load_pack(self, name="pack") -> List[List[Dict]]:
         """Load compression with key and chunk into 10-minute segments."""
         data_file = Path(name) / "data.jsonl"
@@ -356,7 +370,14 @@ def main(
     # Load captions from both candidates
     print("Loading captions from both candidates...")
     video_only_chunks = loader.load_video_only(video_only_name)
-    pack_chunks = loader.load_pack(pack_name)
+    # Use chunk-directory format (label pipeline output) if available, else data.jsonl
+    pack_path = Path(pack_name)
+    has_chunks = any(True for _ in list(pack_path.glob("chunk_??*")))
+    if has_chunks:
+        print(f"  (pack-name has chunk dirs – using load_from_chunks)")
+        pack_chunks = loader.load_from_chunks(pack_name)
+    else:
+        pack_chunks = loader.load_pack(pack_name)
 
     print(f"Loaded {len(video_only_chunks)} video-only chunks")
     print(f"Loaded {len(pack_chunks)} pack chunks")
