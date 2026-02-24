@@ -99,21 +99,16 @@ async def run_naive(
     screenshots_dir = out_dir / "screenshots"
     screenshots_dir.mkdir(exist_ok=True)
 
-    # Extract frames from every monitor recording directly into screenshots/
-    yield "[naive] Extracting frames from ffmpeg recordings…"
-    for mp4 in sorted(ffmpeg_dir.glob("screen_*.mp4")):
-        prefix = mp4.stem  # e.g. "screen_0"
-        tmp_dir = out_dir / f"_tmp_{prefix}"
-        yield f"[naive]   {mp4.name} → {screenshots_dir} (prefix {prefix})"
-        extract_frames_from_video(mp4, tmp_dir)
-        # Move extracted frames into screenshots/ with temporal naming
-        # frame_NNNNNN_screen_N.jpg ensures correct multi-monitor interleaving
-        import shutil
-        for img in sorted(tmp_dir.iterdir()):
-            dest = screenshots_dir / f"{img.stem}_{prefix}{img.suffix}"
-            if not dest.exists():
-                shutil.move(str(img), str(dest))
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    # Extract frames from the single focus-following recording
+    output_mp4 = ffmpeg_dir / "output.mp4"
+    if not output_mp4.exists():
+        yield "[naive] ERROR: output.mp4 not found in ffmpeg dir"
+        state.processing.status["naive"] = "error"
+        state.processing.errors["naive"] = "output.mp4 missing"
+        state.save()
+        return
+    yield f"[naive] Extracting frames from {output_mp4.name}…"
+    extract_frames_from_video(output_mp4, screenshots_dir)
 
     yield "[naive] Running label pipeline (no split)…"
     cmd = _uv_run(
@@ -147,18 +142,15 @@ async def run_split(
     screenshots_dir = out_dir / "screenshots"
     screenshots_dir.mkdir(exist_ok=True)
 
-    yield "[split] Extracting frames from ffmpeg recordings…"
-    import shutil
-    for mp4 in sorted(ffmpeg_dir.glob("screen_*.mp4")):
-        prefix = mp4.stem
-        tmp_dir = out_dir / f"_tmp_{prefix}"
-        yield f"[split]   {mp4.name} → {screenshots_dir} (prefix {prefix})"
-        extract_frames_from_video(mp4, tmp_dir)
-        for img in sorted(tmp_dir.iterdir()):
-            dest = screenshots_dir / f"{img.stem}_{prefix}{img.suffix}"
-            if not dest.exists():
-                shutil.move(str(img), str(dest))
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+    output_mp4 = ffmpeg_dir / "output.mp4"
+    if not output_mp4.exists():
+        yield "[split] ERROR: output.mp4 not found in ffmpeg dir"
+        state.processing.status["split"] = "error"
+        state.processing.errors["split"] = "output.mp4 missing"
+        state.save()
+        return
+    yield f"[split] Extracting frames from {output_mp4.name}…"
+    extract_frames_from_video(output_mp4, screenshots_dir)
 
     yield "[split] Running label pipeline (60 s chunks)…"
     cmd = _uv_run(

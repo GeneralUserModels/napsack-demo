@@ -172,7 +172,6 @@ async function loadGT() {
 
   // Pre-fill from existing GT if available
   if (gtData.existing_gt && gtData.existing_gt.length > 0) {
-    // Re-distribute existing GT back into chunk structure
     const chunkSize = 8;
     for (let i = 0; i < gtData.chunks.length; i++) {
       const slice = gtData.existing_gt.slice(i * chunkSize, (i + 1) * chunkSize);
@@ -190,114 +189,138 @@ function renderGTChunk() {
   const total = gtData.chunks.length;
   document.getElementById('gt-chunk-indicator').textContent = `Chunk ${gtChunkIdx + 1} / ${total}`;
 
-  // Frame viewer
-  renderFrame(chunk, frameIdx);
+  // Fill textarea with one caption per line
+  const lines = chunk.captions.map(c => c.caption ?? '');
+  document.getElementById('gt-textarea').value = lines.join('\n');
 
-  // GT video
-  const gtVideo = gtData.gt_videos?.[gtChunkIdx];
-  const vidContainer = document.getElementById('gt-video-container');
-  const vidEl = document.getElementById('gt-video');
-  if (gtVideo) {
-    vidContainer.classList.remove('hidden');
-    vidEl.src = `/api/media/${encodeURIComponent(gtVideo)}`;
-  } else {
-    vidContainer.classList.add('hidden');
-  }
-
-  // Caption editor
-  renderCaptionEditor(chunk.captions);
+  // Show first frame
+  frameIdx = 0;
+  renderGTFrame();
 }
 
-function renderFrame(chunk, idx) {
-  const imgEl = document.getElementById('frame-img');
-  const labelEl = document.getElementById('frame-caption-label');
-  const frame = chunk.frames?.[idx];
+function renderGTFrame() {
+  if (!gtData) return;
+  const chunk = gtData.chunks[gtChunkIdx];
+  const frames = chunk.frames || [];
+  const imgEl = document.getElementById('gt-frame-img');
+  const labelEl = document.getElementById('gt-frame-label');
+  const indicator = document.getElementById('gt-frame-indicator');
+
+  if (frames.length === 0) {
+    imgEl.src = '';
+    imgEl.style.display = 'none';
+    labelEl.textContent = '';
+    indicator.textContent = 'No frames';
+    return;
+  }
+
+  const idx = Math.min(frameIdx, frames.length - 1);
+  const frame = frames[idx];
   if (frame) {
     imgEl.src = `/api/media/${encodeURIComponent(frame)}`;
     imgEl.style.display = 'block';
   } else {
-    imgEl.src = ''; imgEl.style.display = 'none';
+    imgEl.src = '';
+    imgEl.style.display = 'none';
   }
+
+  // Show which caption this frame corresponds to
   const cap = chunk.captions?.[idx];
-  labelEl.textContent = cap
-    ? `Caption ${idx + 1}: [${cap.start ?? cap.start_time ?? '?'} → ${cap.end ?? cap.end_time ?? '?'}]`
-    : '';
+  if (cap) {
+    const start = cap.start ?? cap.start_time ?? '?';
+    const end = cap.end ?? cap.end_time ?? '?';
+    labelEl.textContent = `Caption ${idx + 1}: [${start} → ${end}]`;
+  } else {
+    labelEl.textContent = '';
+  }
+  indicator.textContent = `${idx + 1} / ${frames.length}`;
 }
 
-function renderCaptionEditor(captions) {
-  const el = document.getElementById('caption-editor');
-  el.innerHTML = '';
-  captions.forEach((cap, i) => {
-    const row = document.createElement('div');
-    row.className = 'caption-item';
-    row.innerHTML = `
-      <input type="text" placeholder="start" value="${escHtml(String(cap.start ?? cap.start_time ?? ''))}"
-             onchange="updateCaption(${i},'start',this.value)" />
-      <input type="text" placeholder="end" value="${escHtml(String(cap.end ?? cap.end_time ?? ''))}"
-             onchange="updateCaption(${i},'end',this.value)" />
-      <textarea rows="2" onchange="updateCaption(${i},'caption',this.value)">${escHtml(cap.caption ?? '')}</textarea>
-      <button class="caption-delete" onclick="deleteCaption(${i})">✕</button>
-    `;
-    el.appendChild(row);
-    // Sync textarea
-    const ta = row.querySelector('textarea');
-    ta.value = cap.caption ?? '';
-  });
-}
-
-function updateCaption(idx, field, val) {
+function prevGTFrame() {
   if (!gtData) return;
-  const cap = gtData.chunks[gtChunkIdx].captions[idx];
-  if (!cap) return;
-  cap[field] = val;
-  // Also keep start_time / end_time in sync for judge alignment
-  if (field === 'start') cap.start_time = val;
-  if (field === 'end') cap.end_time = val;
+  frameIdx = Math.max(0, frameIdx - 1);
+  renderGTFrame();
+  _highlightTextareaLine(frameIdx);
 }
 
-function deleteCaption(idx) {
+function nextGTFrame() {
   if (!gtData) return;
-  gtData.chunks[gtChunkIdx].captions.splice(idx, 1);
-  gtData.chunks[gtChunkIdx].frames?.splice(idx, 1);
-  renderGTChunk();
+  const maxF = (gtData.chunks[gtChunkIdx].frames?.length ?? 1) - 1;
+  frameIdx = Math.min(maxF, frameIdx + 1);
+  renderGTFrame();
+  _highlightTextareaLine(frameIdx);
 }
 
-function addCaption() {
-  if (!gtData) return;
-  gtData.chunks[gtChunkIdx].captions.push({ start: '', end: '', caption: '' });
-  renderCaptionEditor(gtData.chunks[gtChunkIdx].captions);
+function _highlightTextareaLine(lineIdx) {
+  const ta = document.getElementById('gt-textarea');
+  const lines = ta.value.split('\n');
+  if (lineIdx < 0 || lineIdx >= lines.length) return;
+  // Calculate character offsets for the target line
+  let start = 0;
+  for (let i = 0; i < lineIdx; i++) start += lines[i].length + 1;
+  const end = start + lines[lineIdx].length;
+  ta.focus();
+  ta.setSelectionRange(start, end);
 }
+
+// When clicking into the textarea, sync the frame to the cursor's line
+document.addEventListener('DOMContentLoaded', () => {
+  const ta = document.getElementById('gt-textarea');
+  if (ta) {
+    ta.addEventListener('click', () => {
+      const pos = ta.selectionStart;
+      const before = ta.value.substring(0, pos);
+      const lineIdx = before.split('\n').length - 1;
+      if (lineIdx !== frameIdx) {
+        frameIdx = lineIdx;
+        renderGTFrame();
+      }
+    });
+  }
+});
 
 function prevGTChunk() {
   if (!gtData || gtChunkIdx === 0) return;
+  _syncTextareaToChunk(); // save edits before navigating
   gtChunkIdx--; frameIdx = 0; renderGTChunk();
 }
 function nextGTChunk() {
   if (!gtData || gtChunkIdx >= gtData.chunks.length - 1) return;
+  _syncTextareaToChunk(); // save edits before navigating
   gtChunkIdx++; frameIdx = 0; renderGTChunk();
 }
-function prevFrame() {
+
+function _syncTextareaToChunk() {
+  // Sync current textarea content back into gtData
   if (!gtData) return;
-  const maxF = (gtData.chunks[gtChunkIdx].frames?.length ?? 1) - 1;
-  frameIdx = Math.max(0, frameIdx - 1);
-  renderFrame(gtData.chunks[gtChunkIdx], frameIdx);
-}
-function nextFrame() {
-  if (!gtData) return;
-  const maxF = (gtData.chunks[gtChunkIdx].frames?.length ?? 1) - 1;
-  frameIdx = Math.min(maxF, frameIdx + 1);
-  renderFrame(gtData.chunks[gtChunkIdx], frameIdx);
+  const ta = document.getElementById('gt-textarea');
+  const lines = ta.value.split('\n').filter(l => l.trim() !== '');
+  const chunk = gtData.chunks[gtChunkIdx];
+  // Update captions — keep original start/end times, just update caption text
+  const updatedCaptions = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (i < chunk.captions.length) {
+      // Update existing caption's text
+      const orig = chunk.captions[i];
+      updatedCaptions.push({ ...orig, caption: lines[i] });
+    } else {
+      // New line added — create a caption with no timestamps
+      updatedCaptions.push({ start: '', end: '', caption: lines[i] });
+    }
+  }
+  chunk.captions = updatedCaptions;
 }
 
-// Keyboard navigation for frames
+// Keyboard navigation for frames (only when not in an input/textarea)
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-  if (e.key === 'ArrowLeft') prevFrame();
-  if (e.key === 'ArrowRight') nextFrame();
+  if (e.key === 'ArrowLeft') prevGTFrame();
+  if (e.key === 'ArrowRight') nextGTFrame();
 });
 
 async function saveGT() {
   if (!gtData) return;
+  _syncTextareaToChunk(); // sync current chunk first
   // Flatten all chunks
   const allCaptions = gtData.chunks.flatMap(c => c.captions);
   const res = await fetch('/api/gt/save', {

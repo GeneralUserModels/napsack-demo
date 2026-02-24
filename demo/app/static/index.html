@@ -103,8 +103,9 @@
   <!-- Step 3: GT Annotation -->
   <section class="card step-card" id="step3">
     <h2>✏️ Step 3 – Annotate Ground-Truth Captions</h2>
-    <p>Review the <em>split + compress + IO</em> captions (8 at a time) and correct them to produce GT captions.
-       Use arrow keys / buttons to navigate frames. Edit, delete, or add captions inline.</p>
+    <p>Review the <em>split + compress + IO</em> captions and correct them.
+       Left: editable captions (one per line). Right: screenshot matching the selected caption's start time.
+       Click a caption line to see its frame.</p>
     <button class="btn" onclick="loadGT()">Load Captions for Annotation</button>
 
     <div id="gt-nav" class="hidden">
@@ -114,27 +115,28 @@
         <button class="btn btn-sm" onclick="nextGTChunk()">Next Chunk →</button>
       </div>
 
-      <!-- Frame viewer -->
-      <div class="frame-viewer">
-        <button class="btn btn-sm" onclick="prevFrame()">◀</button>
-        <div class="frame-container">
-          <img id="frame-img" src="" alt="frame" />
-          <p id="frame-caption-label" class="frame-label"></p>
+      <div class="gt-split-pane">
+        <!-- LEFT: editable captions -->
+        <div class="gt-left">
+          <h4>Captions <span class="gt-hint">(one per line – click a line to preview its frame)</span></h4>
+          <textarea id="gt-textarea" rows="12" spellcheck="false"></textarea>
         </div>
-        <button class="btn btn-sm" onclick="nextFrame()">▶</button>
-      </div>
 
-      <!-- GT video clip -->
-      <div id="gt-video-container" class="hidden">
-        <p><strong>GT video clip for this chunk:</strong></p>
-        <video id="gt-video" controls style="max-width:100%;border-radius:6px;"></video>
+        <!-- RIGHT: screenshot carousel -->
+        <div class="gt-right">
+          <h4>Screenshot <span id="gt-frame-label" class="gt-hint"></span></h4>
+          <div class="gt-frame-container">
+            <img id="gt-frame-img" src="" alt="frame" />
+          </div>
+          <div class="gt-frame-nav">
+            <button class="btn btn-sm" onclick="prevGTFrame()">◀ Prev</button>
+            <span id="gt-frame-indicator">–</span>
+            <button class="btn btn-sm" onclick="nextGTFrame()">Next ▶</button>
+          </div>
+        </div>
       </div>
-
-      <!-- Caption editor -->
-      <div id="caption-editor"></div>
 
       <div class="row" style="margin-top:12px">
-        <button class="btn" onclick="addCaption()">+ Add Caption</button>
         <button class="btn btn-green" onclick="saveGT()">💾 Save GT Captions</button>
       </div>
     </div>

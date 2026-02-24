@@ -272,31 +272,45 @@ async def get_gt_data():
     session_dir = Path(_state.session_dir)
 
     # Find fused captions
-    fused_dir = session_dir / "split_compress_io" / "fused"
+    fused_dir = session_dir / "split_compress_io"
+    cap_file = fused_dir / "captions.jsonl"
     captions: List[Dict] = []
-    for chunk_dir in sorted(fused_dir.glob("chunk_??*")):
-        cap_file = chunk_dir / "captions.jsonl"
-        if cap_file.exists():
-            with open(cap_file) as f:
-                for line in f:
-                    if line.strip():
-                        captions.append(json.loads(line))
+    if cap_file.exists():
+        with open(cap_file) as f:
+            for line in f:
+                if line.strip():
+                    captions.append(json.loads(line))
 
-    # Find pack screenshots dir for frame serving
-    pack_dir = Path(_state.recording.pack_session_dir or "")
-    screenshots_dir = pack_dir / "screenshots"
+    # Load data.jsonl which maps captions to screenshot paths (1:1 aligned)
+    data_entries: List[Dict] = []
+    data_file = fused_dir / "data.jsonl"
+    if data_file.exists():
+        with open(data_file) as f:
+            for line in f:
+                if line.strip():
+                    data_entries.append(json.loads(line))
 
     # Build 8-caption chunks
     chunk_size = 8
     chunks = []
     for i in range(0, len(captions), chunk_size):
         chunk_caps = captions[i:i + chunk_size]
-        # Attach representative frame paths
+        # Attach frame paths from data.jsonl (index-aligned with captions)
         frames = []
-        for cap in chunk_caps:
-            frame = _find_nearest_frame(screenshots_dir, cap)
-            frames.append(str(frame) if frame else None)
+        for j, cap in enumerate(chunk_caps):
+            data_idx = i + j
+            if data_idx < len(data_entries) and data_entries[data_idx].get("img"):
+                img_path = data_entries[data_idx]["img"]
+                # Verify file exists
+                if Path(img_path).exists():
+                    frames.append(img_path)
+                else:
+                    frames.append(None)
+            else:
+                frames.append(None)
         chunks.append({"captions": chunk_caps, "frames": frames})
+
+    print(f"[gt] Prepared {len(chunks)} GT chunks with frames for annotation UI")
 
     # Also load existing GT if already saved
     gt_path = session_dir / "gt" / "gt_captions.jsonl"
@@ -316,35 +330,6 @@ async def get_gt_data():
         "gt_videos": gt_videos,
         "num_chunks": len(chunks),
     })
-
-
-def _find_nearest_frame(screenshots_dir: Path, cap: Dict) -> Optional[Path]:
-    """Find the screenshot closest to the caption's start_time."""
-    if not screenshots_dir.exists():
-        return None
-    start = cap.get("start_time") or cap.get("start_seconds") or 0
-    try:
-        start = float(start)
-    except (TypeError, ValueError):
-        # Try parsing MM:SS
-        try:
-            parts = str(start).split(":")
-            start = int(parts[0]) * 60 + int(parts[1])
-        except Exception:
-            start = 0.0
-
-    best: Optional[Path] = None
-    best_diff = float("inf")
-    for img in screenshots_dir.glob("*.[jp][pn]g"):
-        try:
-            ts = float(img.stem.split("_")[0]) if "_" in img.stem else float(img.stem)
-            diff = abs(ts - start)
-            if diff < best_diff:
-                best_diff = diff
-                best = img
-        except ValueError:
-            pass
-    return best
 
 
 def _get_gt_videos(session_dir: Path, captions: List[Dict], chunk_size: int) -> List[Optional[str]]:
@@ -380,10 +365,9 @@ def _extract_gt_clip(
     if not ffmpeg_dir.exists():
         return None
 
-    mp4s = sorted(ffmpeg_dir.glob("screen_*.mp4"))
-    if not mp4s:
+    src = ffmpeg_dir / "output.mp4"
+    if not src.exists():
         return None
-    src = mp4s[0]  # use first monitor
 
     # Get time range from captions
     def _to_sec(v):
