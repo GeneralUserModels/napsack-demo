@@ -449,6 +449,7 @@ async function loadResults() {
   const methods = data.methods || ['naive', 'split', 'split_compress', 'split_compress_io'];
   const sizes = data.mp4_sizes_mb || {};
   const judgeData = data.judge?.methods || {};
+  const humanRanks = data.human_eval?.mean_human_rank || {};
 
   // Table
   const tbody = document.getElementById('results-tbody');
@@ -457,9 +458,10 @@ async function loadResults() {
     const jd = judgeData[m] || {};
     const mean = jd.mean != null ? jd.mean.toFixed(2) : '–';
     const se = jd.bootstrap_se != null ? jd.bootstrap_se.toFixed(2) : '–';
+    const rank = humanRanks[m] != null ? humanRanks[m].toFixed(2) : '–';
     const sz = sizes[m] != null ? `${sizes[m]} MB` : '–';
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(m)}</td><td>${mean} ± ${se}</td><td>${sz}</td>`;
+    tr.innerHTML = `<td>${escHtml(m)}</td><td>${mean} ± ${se}</td><td>${rank}</td><td>${sz}</td>`;
     tbody.appendChild(tr);
   });
   document.getElementById('results-table-container').classList.remove('hidden');
@@ -469,17 +471,18 @@ async function loadResults() {
     const he = data.human_eval;
     const cTbody = document.getElementById('corr-tbody');
     cTbody.innerHTML = `
-      <tr><td>Pearson r</td><td>${he.pearson_r?.toFixed(3) ?? '–'} (p=${he.pearson_p?.toFixed(3) ?? '–'})</td></tr>
-      <tr><td>Spearman ρ</td><td>${he.spearman_rho?.toFixed(3) ?? '–'} (p=${he.spearman_p?.toFixed(3) ?? '–'})</td></tr>
+      <tr><td>Pearson <em>r</em></td><td>${he.pearson_r?.toFixed(3) ?? '–'}</td><td>${he.pearson_p?.toFixed(4) ?? '–'}</td></tr>
+      <tr><td>Spearman <em>ρ</em></td><td>${he.spearman_rho?.toFixed(3) ?? '–'}</td><td>${he.spearman_p?.toFixed(4) ?? '–'}</td></tr>
     `;
     document.getElementById('correlation-container').classList.remove('hidden');
   }
 
   // LaTeX
-  buildLatex(methods, sizes, judgeData, data.judge?.num_gt_chunks);
+  buildLatex(methods, sizes, judgeData, data.judge?.num_gt_chunks, humanRanks);
 }
 
-function buildLatex(methods, sizes, judgeData, numGT) {
+function buildLatex(methods, sizes, judgeData, numGT, humanRanks) {
+  const hasRanks = humanRanks && Object.keys(humanRanks).length > 0;
   const methodLabels = {
     naive: 'naive',
     split: '+ split',
@@ -493,15 +496,20 @@ function buildLatex(methods, sizes, judgeData, numGT) {
     const sz = sizes[m] != null ? sizes[m].toFixed(0) : '?';
     const label = methodLabels[m] || m;
     const hrule = m === 'naive' ? '\\midrule\n' : '';
-    return `${hrule}        ${label} & $${mean} \\pm ${se}$ & \\SI{${sz}}{\\mega\\byte} \\\\`;
+    const rankCol = hasRanks
+      ? ` & ${humanRanks[m] != null ? humanRanks[m].toFixed(2) : '?'}`
+      : '';
+    return `${hrule}        ${label} & $${mean} \\pm ${se}$${rankCol} & \\SI{${sz}}{\\mega\\byte} \\\\`;
   }).join('\n');
 
   const nStr = numGT != null ? `$n={${numGT} \\cdot 8}$` : '$n={?}$';
+  const rankHeader = hasRanks ? ' & Avg Rank ($\\downarrow$)' : '';
+  const colSpec = hasRanks ? 'lrrr' : 'lrr';
   const latex = `\\begin{table}[]
     \\centering
-    \\begin{tabular}{lrr}
+    \\begin{tabular}{${colSpec}}
         \\toprule
-        Method & Judge Score ($\\uparrow$) & Size ($\\downarrow$) \\\\
+        Method & Judge Score ($\\uparrow$)${rankHeader} & Size ($\\downarrow$) \\\\
         \\midrule
 ${rows}
         \\bottomrule

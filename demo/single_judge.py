@@ -273,26 +273,20 @@ DEMO_METHODS = ["naive", "split", "split_compress", "split_compress_io"]
 
 
 def _load_method_chunks(session_dir: Path, method: str) -> List[List[Dict]]:
-    """Load captions from the appropriate sub-directory for each method."""
-    loader = CaptionLoader(base_path=str(session_dir))
-    if method == "naive":
-        return loader.load_from_chunk_dirs(str(session_dir / "naive"))
-    elif method == "split":
-        return loader.load_from_chunk_dirs(str(session_dir / "split"))
-    elif method == "split_compress":
-        # label writes chunks into pack_session; find it via state.json
-        state_file = session_dir / "state.json"
-        if state_file.exists():
-            with open(state_file) as f:
-                state = json.load(f)
-            sc_dir = (state.get("processing", {}).get("output_dirs", {}) or {}).get("split_compress")
-            if sc_dir:
-                return loader.load_from_chunk_dirs(sc_dir)
+    """Load flat captions from {method}/captions.jsonl and return as a
+    single-element list so callers can flatten→re-align via _chunk_captions_by_gt.
+    """
+    cap_file = session_dir / method / "captions.jsonl"
+    if not cap_file.exists():
+        print(f"Warning: captions file not found: {cap_file}")
         return []
-    elif method == "split_compress_io":
-        fused_dir = session_dir / "split_compress_io" / "fused"
-        return loader.load_from_chunk_dirs(str(fused_dir))
-    return []
+    entries: List[Dict] = []
+    with open(cap_file) as f:
+        for line in f:
+            if line.strip():
+                entries.append(json.loads(line))
+    # Return as [[all_captions]] – callers flatten then re-align by GT windows
+    return [entries] if entries else []
 
 
 def _chunk_captions_by_gt(method_chunks_flat: List[Dict], gt_chunks: List[List[Dict]]) -> List[List[Dict]]:
