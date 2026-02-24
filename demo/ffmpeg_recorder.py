@@ -37,49 +37,62 @@ class MonitorInfo:
 
 
 def _get_monitors_linux() -> List[MonitorInfo]:
-    """Use xrandr to enumerate connected monitors on Linux/X11."""
+    """Use xrandr to enumerate connected monitors on Linux/X11.
+    Returns only the primary monitor (or the focused one)."""
     try:
         out = subprocess.check_output(["xrandr", "--query"], text=True)
     except FileNotFoundError:
         raise RuntimeError("xrandr not found. Ensure X11/xrandr is installed.")
 
     monitors = []
+    primary = None
     idx = 0
     for line in out.splitlines():
-        # Lines like: HDMI-1 connected 1920x1080+0+0 (normal …)
+        # Lines like: HDMI-1 connected primary 1920x1080+0+0 (normal …)
+        # or:         DP-1 connected 2560x1440+1920+0 (normal …)
         if " connected" in line and "disconnected" not in line:
             parts = line.split()
             name = parts[0]
+            is_primary = "primary" in parts
             # Find the geometry token e.g. "1920x1080+0+0"
             for token in parts:
-                if "x" in token and "+" in token:
+                if "x" in token and "+" in token and not token.startswith("("):
                     try:
-                        res, ox, oy = token.replace("+", " ").replace("x", " ", 1).split()
-                        monitors.append(MonitorInfo(
+                        # Parse "1920x1080+0+0"
+                        geom = token
+                        w_h, ox, oy = geom.split("+")[0], geom.split("+")[1], geom.split("+")[2]
+                        w, h = w_h.split("x")
+                        mon = MonitorInfo(
                             index=idx,
-                            width=int(res.split("x")[0]) if "x" in res else int(res),
-                            height=int(token.split("x")[1].split("+")[0]),
+                            width=int(w),
+                            height=int(h),
                             x=int(ox),
                             y=int(oy),
                             name=name,
-                        ))
+                        )
+                        monitors.append(mon)
+                        if is_primary:
+                            primary = mon
                         idx += 1
                         break
                     except Exception:
                         pass
-    if not monitors:
-        # Fallback: record the whole virtual desktop at :0
-        try:
-            out2 = subprocess.check_output(["xdpyinfo"], text=True)
-            for line in out2.splitlines():
-                if "dimensions:" in line:
-                    dims = line.strip().split()[1]
-                    w, h = dims.split("x")
-                    monitors.append(MonitorInfo(0, int(w), int(h), 0, 0, ":0"))
-                    break
-        except Exception:
-            monitors.append(MonitorInfo(0, 1920, 1080, 0, 0, ":0"))
-    return monitors
+
+    # Return all connected monitors individually (one video per monitor)
+    if monitors:
+        return monitors
+
+    # Fallback: try xdpyinfo for whole-screen dimensions
+    try:
+        out2 = subprocess.check_output(["xdpyinfo"], text=True)
+        for line in out2.splitlines():
+            if "dimensions:" in line:
+                dims = line.strip().split()[1]
+                w, h = dims.split("x")
+                return [MonitorInfo(0, int(w), int(h), 0, 0, ":0")]
+    except Exception:
+        pass
+    return [MonitorInfo(0, 1920, 1080, 0, 0, ":0")]
 
 
 def _get_monitors_macos() -> List[MonitorInfo]:
@@ -152,8 +165,11 @@ def _build_ffmpeg_cmd_linux(monitor: MonitorInfo, output_path: str) -> List[str]
         "-i", f"{display}+{monitor.x},{monitor.y}",
         "-vf", "format=yuv420p",
         "-c:v", "libx264",
-        "-crf", "23",           # ~JPEG-70 equivalent quality
-        "-preset", "fast",
+        "-crf", "23",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-threads", "1",
+        "-flush_packets", "1",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -168,7 +184,10 @@ def _build_ffmpeg_cmd_macos(monitor: MonitorInfo, output_path: str) -> List[str]
         "-vf", "format=yuv420p",
         "-c:v", "libx264",
         "-crf", "23",
-        "-preset", "fast",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-threads", "1",
+        "-flush_packets", "1",
         "-movflags", "+faststart",
         output_path,
     ]
@@ -182,7 +201,10 @@ def _build_ffmpeg_cmd_windows(monitor: MonitorInfo, output_path: str) -> List[st
         "-vf", "format=yuv420p",
         "-c:v", "libx264",
         "-crf", "23",
-        "-preset", "fast",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-threads", "1",
+        "-flush_packets", "1",
         "-movflags", "+faststart",
         output_path,
     ]

@@ -27,10 +27,15 @@ def _uv_run(*args: str) -> List[str]:
     return ["uv", "run", *args]
 
 
-def _total_mp4_size_mb(directory: Path) -> float:
-    """Sum up all .mp4 files (recursive) in a directory, in megabytes."""
-    total = sum(p.stat().st_size for p in directory.rglob("*.mp4") if p.is_file())
-    return round(total / (1024 ** 2), 2)
+def _total_mp4_size_mb(directory: Path, exclude_master: bool = True) -> float:
+    """Sum up all .mp4 files (recursive) in a directory, in decimal megabytes.
+    Optionally excludes master.mp4 to avoid double-counting with chunks."""
+    total = sum(
+        p.stat().st_size
+        for p in directory.rglob("*.mp4")
+        if p.is_file() and not (exclude_master and p.name == "master.mp4")
+    )
+    return round(total / 1_000_000, 2)
 
 
 async def _stream_subprocess(cmd: List[str], cwd: Optional[str] = None) -> AsyncIterator[str]:
@@ -58,6 +63,8 @@ async def _stream_subprocess(cmd: List[str], cwd: Optional[str] = None) -> Async
 def extract_frames_from_video(video_path: Path, out_dir: Path, fps: int = 1) -> Path:
     """
     Extract frames from an MP4 at `fps` frames/second into out_dir.
+    Files are named frame_000001.jpg, frame_000002.jpg, etc.
+    Default 1fps matches Gemini's native sampling rate.
     Returns out_dir.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -66,9 +73,9 @@ def extract_frames_from_video(video_path: Path, out_dir: Path, fps: int = 1) -> 
         "-i", str(video_path),
         "-vf", f"fps={fps}",
         "-q:v", "5",  # ~JPEG quality 70
-        str(out_dir / "%017.3f.jpg"),  # 17-char float timestamp prefix (seconds)
+        str(out_dir / "frame_%06d.jpg"),
     ]
-    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return out_dir
 
 
@@ -85,35 +92,37 @@ async def run_naive(
     Naive: whole-video Gemini captioning (no splitting, no compression).
     Frames are extracted at 1fps from the ffmpeg screen recording, then
     labelled with a very large chunk duration to avoid splitting.
+    Gemini samples at 1fps natively, so all extracted frames are processed.
     """
     out_dir = session_dir / "naive"
     out_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir = out_dir / "screenshots"
+    screenshots_dir = out_dir / "screenshots"
+    screenshots_dir.mkdir(exist_ok=True)
 
-    # Extract frames from every monitor recording
+    # Extract frames from every monitor recording directly into screenshots/
     yield "[naive] Extracting frames from ffmpeg recordings…"
     for mp4 in sorted(ffmpeg_dir.glob("screen_*.mp4")):
-        target = frames_dir / mp4.stem
-        yield f"[naive]   {mp4.name} → {target}"
-        extract_frames_from_video(mp4, target)
-    # Merge all frame dirs into one by symlinking / copying
-    merged = out_dir / "screenshots_merged"
-    merged.mkdir(exist_ok=True)
-    import shutil
-    for sub in sorted(frames_dir.iterdir()):
-        for img in sorted(sub.iterdir()):
-            dest = merged / img.name
+        prefix = mp4.stem  # e.g. "screen_0"
+        tmp_dir = out_dir / f"_tmp_{prefix}"
+        yield f"[naive]   {mp4.name} → {screenshots_dir} (prefix {prefix})"
+        extract_frames_from_video(mp4, tmp_dir)
+        # Move extracted frames into screenshots/ with temporal naming
+        # frame_NNNNNN_screen_N.jpg ensures correct multi-monitor interleaving
+        import shutil
+        for img in sorted(tmp_dir.iterdir()):
+            dest = screenshots_dir / f"{img.stem}_{prefix}{img.suffix}"
             if not dest.exists():
-                shutil.copy2(img, dest)
+                shutil.move(str(img), str(dest))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     yield "[naive] Running label pipeline (no split)…"
     cmd = _uv_run(
         "-m", "label",
         "--session", str(out_dir),
-        "--video-only",
+        "--screenshots-only",
         "--chunk-duration", "99999",
         "--client", "gemini",
-        "--model", "gemini-2.0-flash-preview",
+        "--model", "gemini-3-flash-preview",
     )
     async for line in _stream_subprocess(cmd):
         yield f"[naive] {line}"
@@ -135,28 +144,30 @@ async def run_split(
     """
     out_dir = session_dir / "split"
     out_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir = out_dir / "screenshots_merged"
-    frames_dir.mkdir(exist_ok=True)
+    screenshots_dir = out_dir / "screenshots"
+    screenshots_dir.mkdir(exist_ok=True)
 
     yield "[split] Extracting frames from ffmpeg recordings…"
     import shutil
     for mp4 in sorted(ffmpeg_dir.glob("screen_*.mp4")):
-        target = out_dir / "screenshots" / mp4.stem
-        yield f"[split]   {mp4.name} → {target}"
-        extract_frames_from_video(mp4, target)
-        for img in sorted(target.iterdir()):
-            dest = frames_dir / img.name
+        prefix = mp4.stem
+        tmp_dir = out_dir / f"_tmp_{prefix}"
+        yield f"[split]   {mp4.name} → {screenshots_dir} (prefix {prefix})"
+        extract_frames_from_video(mp4, tmp_dir)
+        for img in sorted(tmp_dir.iterdir()):
+            dest = screenshots_dir / f"{img.stem}_{prefix}{img.suffix}"
             if not dest.exists():
-                shutil.copy2(img, dest)
+                shutil.move(str(img), str(dest))
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     yield "[split] Running label pipeline (60 s chunks)…"
     cmd = _uv_run(
         "-m", "label",
         "--session", str(out_dir),
-        "--video-only",
+        "--screenshots-only",
         "--chunk-duration", "60",
         "--client", "gemini",
-        "--model", "gemini-2.0-flash-preview",
+        "--model", "gemini-3-flash-preview",
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split] {line}"
@@ -176,34 +187,56 @@ async def run_split_compress(
     """
     Split + compress: use pack screenshots (event-driven, already compressed)
     and build 1-min chunk videos, then label with Gemini.
+    Data files are copied into the method's own directory so label outputs
+    stay isolated from the original pack_session.
     """
+    import shutil
+
     out_dir = session_dir / "split_compress"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    screenshots_dir = pack_session_dir / "screenshots"
-    if not screenshots_dir.exists():
+    pack_screenshots = pack_session_dir / "screenshots"
+    if not pack_screenshots.exists():
         yield "[split_compress] ERROR: pack screenshots dir not found"
         state.processing.status["split_compress"] = "error"
         state.processing.errors["split_compress"] = "screenshots dir missing"
         state.save()
         return
 
-    # Point label at the pack session which already has screenshots/
+    # Copy pack screenshots into our own directory
+    local_screenshots = out_dir / "screenshots"
+    if local_screenshots.exists():
+        shutil.rmtree(local_screenshots)
+    yield "[split_compress] Copying pack screenshots → split_compress/screenshots …"
+    shutil.copytree(str(pack_screenshots), str(local_screenshots))
+
+    # Copy aggregations.jsonl if present
+    agg_src = pack_session_dir / "aggregations.jsonl"
+    if agg_src.exists():
+        shutil.copy2(str(agg_src), str(out_dir / "aggregations.jsonl"))
+
+    # Point label at our isolated directory
     yield "[split_compress] Running label pipeline on pack screenshots (60 s chunks)…"
     cmd = _uv_run(
         "-m", "label",
-        "--session", str(pack_session_dir),
-        "--video-only",
+        "--session", str(out_dir),
+        "--screenshots-only",
         "--chunk-duration", "60",
         "--client", "gemini",
-        "--model", "gemini-2.0-flash-preview",
+        "--model", "gemini-3-flash-preview",
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split_compress] {line}"
 
-    state.processing.output_dirs["split_compress"] = str(pack_session_dir)
+    # Clean up redundant master.mp4 if present
+    master_mp4 = out_dir / "chunks" / "master.mp4"
+    if master_mp4.exists():
+        master_mp4.unlink()
+        yield "[split_compress] Removed redundant master.mp4"
+
+    state.processing.output_dirs["split_compress"] = str(out_dir)
     # MP4 size = chunk videos built from pack screenshots
-    state.processing.mp4_sizes_mb["split_compress"] = _total_mp4_size_mb(pack_session_dir)
+    state.processing.mp4_sizes_mb["split_compress"] = _total_mp4_size_mb(out_dir)
     state.processing.status["split_compress"] = "done"
     state.save()
     yield "[split_compress] ✓ done"
@@ -217,45 +250,74 @@ async def run_split_compress_io(
     """
     Split + compress + IO: full pack labelling (screenshots + events), then
     fuse with split_compress video-only captions via pack_fuse.py.
+    Data files are copied into the method's own directory so label outputs
+    stay isolated from the original pack_session.
     """
+    import shutil
+
     out_dir = session_dir / "split_compress_io"
     out_dir.mkdir(parents=True, exist_ok=True)
     fused_dir = out_dir / "fused"
     fused_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: label pack session with full IO context
+    pack_screenshots = pack_session_dir / "screenshots"
+    if not pack_screenshots.exists():
+        yield "[split_compress_io] ERROR: pack screenshots dir not found"
+        state.processing.status["split_compress_io"] = "error"
+        state.processing.errors["split_compress_io"] = "screenshots dir missing"
+        state.save()
+        return
+
+    # Copy pack data into our own directory
+    local_screenshots = out_dir / "screenshots"
+    if local_screenshots.exists():
+        shutil.rmtree(local_screenshots)
+    yield "[split_compress_io] Copying pack screenshots → split_compress_io/screenshots …"
+    shutil.copytree(str(pack_screenshots), str(local_screenshots))
+
+    # Copy aggregations.jsonl if present
+    agg_src = pack_session_dir / "aggregations.jsonl"
+    if agg_src.exists():
+        shutil.copy2(str(agg_src), str(out_dir / "aggregations.jsonl"))
+
+    # Step 1: label our isolated copy with full IO context
     yield "[split_compress_io] Running full pack label (screenshots + events)…"
     cmd = _uv_run(
         "-m", "label",
-        "--session", str(pack_session_dir),
+        "--session", str(out_dir),
         "--chunk-duration", "60",
         "--client", "gemini",
-        "--model", "gemini-2.0-flash-preview",
+        "--model", "gemini-3-flash-preview",
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split_compress_io] {line}"
 
+    # Clean up redundant master.mp4 (chunks already split from it)
+    master_mp4 = out_dir / "chunks" / "master.mp4"
+    if master_mp4.exists():
+        master_mp4.unlink()
+        yield "[split_compress_io] Removed redundant master.mp4"
+
     # split_compress output dir (video-only captions already produced)
-    sc_dir = state.processing.output_dirs.get("split_compress") or str(pack_session_dir)
+    sc_dir = state.processing.output_dirs.get("split_compress") or str(session_dir / "split_compress")
 
     # Step 2: fuse video-only + pack captions
     yield "[split_compress_io] Fusing captions with pack_fuse.py…"
     demo_dir = Path(__file__).parent.parent  # demo/
     fuse_script = demo_dir / "pack_fuse.py"
-    # video chunks were built by the label pipeline inside pack_session_dir
-    chunk_video_dir = pack_session_dir  # label writes chunk_NNN.mp4 here
+    # video chunks were built by the label pipeline inside out_dir (isolated)
     cmd2 = [
         sys.executable, str(fuse_script),
         "--video-only-name", sc_dir,
-        "--pack-name", str(pack_session_dir),
-        "--video-dir", str(chunk_video_dir),
+        "--pack-name", str(out_dir),
+        "--video-dir", str(out_dir),
         "--output-dir", str(fused_dir),
     ]
     async for line in _stream_subprocess(cmd2):
         yield f"[split_compress_io] {line}"
 
     state.processing.output_dirs["split_compress_io"] = str(fused_dir)
-    state.processing.mp4_sizes_mb["split_compress_io"] = _total_mp4_size_mb(pack_session_dir)
+    state.processing.mp4_sizes_mb["split_compress_io"] = _total_mp4_size_mb(out_dir)
     state.processing.status["split_compress_io"] = "done"
     state.save()
     yield "[split_compress_io] ✓ done"

@@ -36,6 +36,7 @@ from demo.ffmpeg_recorder import FFmpegRecorder
 load_dotenv()
 
 REPO_ROOT = Path(__file__).parent.parent.parent
+DEFAULT_SESSION_DIR = str(REPO_ROOT / "demo-session")
 STATIC_DIR = Path(__file__).parent / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 
@@ -113,15 +114,14 @@ async def get_status():
     gemini_ok = bool(os.environ.get("GEMINI_API_KEY", ""))
     d = _state.to_json()
     d["gemini_key_ok"] = gemini_ok
+    d["default_session_dir"] = DEFAULT_SESSION_DIR
     return JSONResponse(d)
 
 
 @app.post("/api/session")
 async def set_session(body: dict):
     global _state
-    session_dir = body.get("session_dir", "")
-    if not session_dir:
-        raise HTTPException(status_code=400, detail="session_dir required")
+    session_dir = body.get("session_dir", "") or DEFAULT_SESSION_DIR
     p = Path(session_dir)
     p.mkdir(parents=True, exist_ok=True)
     _state = DemoState.load(str(p))
@@ -232,6 +232,15 @@ async def process_method(method: str):
         raise HTTPException(status_code=400, detail="Set session_dir first")
     if _state.processing.status.get(method) == "running":
         return JSONResponse({"status": "already_running"})
+
+    # Dependency: split_compress_io requires split_compress to be done
+    if method == "split_compress_io":
+        sc_status = _state.processing.status.get("split_compress")
+        if sc_status != "done":
+            raise HTTPException(
+                status_code=400,
+                detail="split_compress must be completed before running split_compress_io",
+            )
 
     session_dir = Path(_state.session_dir)
 

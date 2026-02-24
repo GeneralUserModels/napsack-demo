@@ -57,7 +57,7 @@ class GeminiResponse:
 
 
 class GeminiClient(VLMClient):
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-2.5-flash"):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "gemini-3-flash-preview"):
         if genai is None:
             raise RuntimeError("google-genai not installed")
 
@@ -365,7 +365,7 @@ def main(
 
     # Initialize loader and client
     loader = CaptionLoader()
-    client = GeminiClient(api_key=api_key, model_name="gemini-2.5-flash")
+    client = GeminiClient(api_key=api_key, model_name="gemini-3-flash-preview")
 
     # Load captions from both candidates
     print("Loading captions from both candidates...")

@@ -289,14 +289,20 @@ def create_video(
 
                     img.save(dst)
                 else:
-                    shutil.copy2(src, dst)
+                    # Must convert properly — shutil.copy2 would copy JPEG
+                    # bytes into a .png file which ffmpeg cannot decode.
+                    with Image.open(src) as im:
+                        im.save(dst, format="PNG")
                     pending_movement = []
         else:
             # Use image_paths directly (screenshots-only mode)
             for idx, img_path in enumerate(image_paths):
                 src = Path(img_path)
                 dst = tmpdir_path / f"{idx:06d}.png"
-                shutil.copy2(src, dst)
+                # Must convert properly — shutil.copy2 would copy JPEG bytes
+                # into a .png file which ffmpeg cannot decode.
+                with Image.open(src) as im:
+                    im.save(dst, format="PNG")
 
         vf_parts = []
         if pad_to:

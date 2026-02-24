@@ -30,14 +30,36 @@ function clearLog() { logEl.innerHTML = ''; }
 })();
 
 // ── Polling ────────────────────────────────────────────────────────────────
+let _initialSessionLoaded = false;
+let _appRevealed = false;
 async function pollStatus() {
   try {
     const res = await fetch('/api/status');
     serverState = await res.json();
     applyState(serverState);
+
+    // Hide loading overlay and reveal app on first successful response
+    if (!_appRevealed) {
+      _appRevealed = true;
+      document.getElementById('loading-overlay').classList.add('hidden');
+      document.getElementById('app-wrapper').classList.remove('hidden');
+    }
+
+    // On very first poll, pre-populate input and auto-load default session
+    const inp = document.getElementById('session-dir-input');
+    if (!_initialSessionLoaded && serverState.default_session_dir) {
+      _initialSessionLoaded = true;
+      if (!inp.value) inp.value = serverState.default_session_dir;
+      // Auto-load if no session is active yet
+      if (!serverState.session_dir) {
+        await loadSession();
+      }
+    }
   } catch (_) {}
 }
 setInterval(pollStatus, 3000);
+// Defer first poll so the loading overlay has time to paint
+setTimeout(pollStatus, 50);
 
 function applyState(s) {
   // Gemini key warning
@@ -98,23 +120,42 @@ async function loadSession() {
 
 // ── Step 1: Recording ──────────────────────────────────────────────────────
 async function toggleRecording() {
+  // Ensure session is loaded before starting
+  if (!serverState?.session_dir) {
+    await loadSession();
+    if (!serverState?.session_dir) {
+      appendLog('[record] Cannot start — no session directory set', true);
+      return;
+    }
+  }
   if (serverState?.recording?.running) {
-    await fetch('/api/record/stop', { method: 'POST' });
-    appendLog('[record] Stop requested');
+    const res = await fetch('/api/record/stop', { method: 'POST' });
+    if (!res.ok) { appendLog('[record] Stop failed: ' + await res.text(), true); }
+    else { appendLog('[record] Stop requested'); }
   } else {
     const w = parseInt(document.getElementById('max-res-w').value) || 1920;
     const h = parseInt(document.getElementById('max-res-h').value) || 1080;
-    await fetch('/api/record/start', {
+    const res = await fetch('/api/record/start', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ max_res: [w, h] })
     });
-    appendLog('[record] Start requested');
+    if (!res.ok) { appendLog('[record] Start failed: ' + await res.text(), true); }
+    else { appendLog('[record] Start requested'); }
   }
   await pollStatus();
 }
 
 // ── Step 2: Processing ─────────────────────────────────────────────────────
 async function runMethod(method) {
+  // Enforce dependency: split_compress_io requires split_compress to be done
+  if (method === 'split_compress_io') {
+    const scStatus = (serverState.processing?.status || {})['split_compress'];
+    if (scStatus !== 'done') {
+      appendLog('[process] Cannot run split_compress_io: "split + compress" must be completed first.', true);
+      alert('"+ split + compress" must be completed before running "+ split + compress + IO".');
+      return;
+    }
+  }
   const res = await fetch(`/api/process/${method}`, { method: 'POST' });
   const data = await res.json();
   appendLog(`[process] ${method}: ${data.status}`);

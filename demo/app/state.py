@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -111,21 +111,24 @@ class DemoState:
             return _to_dict(self)
 
 
-def _to_dict(state: DemoState) -> Dict[str, Any]:
+def _to_dict(state: Any) -> Dict[str, Any]:
     """Recursively convert dataclass to plain dict (skips _lock)."""
+    import dataclasses
+
     def _conv(obj: Any) -> Any:
-        if isinstance(obj, threading.Lock):
-            return None  # skip
-        if hasattr(obj, "__dataclass_fields__"):
-            return {k: _conv(v) for k, v in asdict(obj).items() if k != "_lock"}
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return {
+                f.name: _conv(getattr(obj, f.name))
+                for f in dataclasses.fields(obj)
+                if f.name != "_lock"
+            }
         if isinstance(obj, dict):
             return {k: _conv(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [_conv(v) for v in obj]
         return obj
 
-    d = {k: _conv(v) for k, v in asdict(state).items() if k != "_lock"}
-    return d
+    return _conv(state)
 
 
 def _from_dict(data: Dict[str, Any]) -> DemoState:
