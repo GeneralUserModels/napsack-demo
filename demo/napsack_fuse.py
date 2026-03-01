@@ -139,7 +139,7 @@ class CaptionLoader:
         return chunks
 
     def load_from_chunks(self, name: str) -> List[List[Dict]]:
-        """Load pack captions from chunk_NNN/captions.jsonl (label pipeline output format)."""
+        """Load napsack captions from chunk_NNN/captions.jsonl (label pipeline output format)."""
         base = Path(name)
         chunks = []
         for chunk_dir in sorted(base.glob("chunk_????")):
@@ -152,7 +152,7 @@ class CaptionLoader:
                 chunks.append(self._load_jsonl(cap_file))
         return chunks
 
-    def load_pack(self, name="pack") -> List[List[Dict]]:
+    def load_napsack(self, name="napsack") -> List[List[Dict]]:
         """Load compression with key and chunk into 10-minute segments."""
         data_file = Path(name) / "data.jsonl"
         all_entries = self._load_jsonl(data_file)
@@ -201,10 +201,10 @@ def format_video_only_captions(captions: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-def format_pack_captions(captions: List[Dict], reference_timestamp: Optional[float] = None) -> str:
-    """Format pack captions for the prompt with relative timestamps."""
+def format_napsack_captions(captions: List[Dict], reference_timestamp: Optional[float] = None) -> str:
+    """Format napsack captions for the prompt with relative timestamps."""
     if not captions:
-        return "No pack captions available."
+        return "No napsack captions available."
 
     def sec_to_mmss(seconds: float) -> str:
         mm = int(seconds) // 60
@@ -224,15 +224,15 @@ def format_pack_captions(captions: List[Dict], reference_timestamp: Optional[flo
     return "\n".join(lines)
 
 
-def create_fusion_prompt(video_only_captions: List[Dict], pack_captions: List[Dict]) -> str:
+def create_fusion_prompt(video_only_captions: List[Dict], napsack_captions: List[Dict]) -> str:
     video_only_text = format_video_only_captions(video_only_captions)
-    pack_text = format_pack_captions(pack_captions)
+    napsack_text = format_napsack_captions(napsack_captions)
 
     prompt = f"""You are a Technical Video Analyst. Your task is to generate a high-granularity timeline of computer interactions.
 
 ## Input Sources:
 1. Visual Stream (Video-Only): Captions that only describe what is visible on the screen.
-2. Input Stream (Pack/Telemetry): Captions that rather focus on integrating recorded keystroke and user input events.
+2. Input Stream (NAPsack/Telemetry): Captions that rather focus on integrating recorded keystroke and user input events.
 
 ---
 
@@ -263,7 +263,7 @@ Every significant input or visual transition deserves its own caption.
 {video_only_text}
 
 ### Input Stream:
-{pack_text}
+{napsack_text}
 
 ---
 
@@ -304,7 +304,7 @@ def add_derived_fields(caption: Dict, chunk_index: int) -> Dict:
 
 def fuse_captions_for_chunk(
     video_only_chunk: List[Dict],
-    pack_chunk: List[Dict],
+    napsack_chunk: List[Dict],
     video_file_path: str,
     chunk_index: int,
     client: GeminiClient
@@ -313,14 +313,14 @@ def fuse_captions_for_chunk(
 
     print(f"Processing chunk {chunk_index}...")
     print(f"  Video-only captions: {len(video_only_chunk)}")
-    print(f"  Pack captions: {len(pack_chunk)}")
+    print(f"  NAPsack captions: {len(napsack_chunk)}")
 
     # Upload video file
     print(f"  Uploading video file: {video_file_path}")
     video_descriptor = client.upload_file(video_file_path)
 
     # Create fusion prompt
-    prompt = create_fusion_prompt(video_only_chunk, pack_chunk)
+    prompt = create_fusion_prompt(video_only_chunk, napsack_chunk)
 
     # Generate fused captions
     print(f"  Generating fused captions...")
@@ -343,7 +343,7 @@ def fuse_captions_for_chunk(
 
 def main(
     video_only_name: str,
-    pack_name: str,
+    napsack_name: str,
     video_dir: str,
     output_dir: str,
     api_key: Optional[str] = None
@@ -353,7 +353,7 @@ def main(
 
     Args:
         video_only_name: Name of the video-only candidate folder
-        pack_name: Name of the pack candidate folder
+        napsack_name: Name of the napsack candidate folder
         video_dir: Directory containing video chunk files (e.g., "chunk_000.mp4")
         output_dir: Directory to save fused captions
         api_key: Gemini API key (optional, can use GEMINI_API_KEY env var)
@@ -371,16 +371,16 @@ def main(
     print("Loading captions from both candidates...")
     video_only_chunks = loader.load_video_only(video_only_name)
     # Use chunk-directory format (label pipeline output) if available, else data.jsonl
-    pack_path = Path(pack_name)
-    has_chunks = any(True for _ in list(pack_path.glob("chunk_??*")))
+    napsack_path = Path(napsack_name)
+    has_chunks = any(True for _ in list(napsack_path.glob("chunk_??*")))
     if has_chunks:
-        print(f"  (pack-name has chunk dirs – using load_from_chunks)")
-        pack_chunks = loader.load_from_chunks(pack_name)
+        print(f"  (napsack-name has chunk dirs – using load_from_chunks)")
+        napsack_chunks = loader.load_from_chunks(napsack_name)
     else:
-        pack_chunks = loader.load_pack(pack_name)
+        napsack_chunks = loader.load_napsack(napsack_name)
 
     print(f"Loaded {len(video_only_chunks)} video-only chunks")
-    print(f"Loaded {len(pack_chunks)} pack chunks")
+    print(f"Loaded {len(napsack_chunks)} napsack chunks")
 
     # Process each chunk
     num_chunks = len(video_only_chunks)
@@ -388,7 +388,7 @@ def main(
 
     for i in range(num_chunks):
         video_only_chunk = video_only_chunks[i] if i < len(video_only_chunks) else []
-        pack_chunk = pack_chunks[i] if i < len(pack_chunks) else []
+        napsack_chunk = napsack_chunks[i] if i < len(napsack_chunks) else []
 
         # Construct video file path
         video_file = video_dir / f"chunk_{str(i).zfill(3)}.mp4"
@@ -400,7 +400,7 @@ def main(
         # Fuse captions for this chunk
         fused = fuse_captions_for_chunk(
             video_only_chunk=video_only_chunk,
-            pack_chunk=pack_chunk,
+            napsack_chunk=napsack_chunk,
             video_file_path=str(video_file),
             chunk_index=i,
             client=client
@@ -448,9 +448,9 @@ def main(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Fuse captions from video-only and pack candidates")
+    parser = argparse.ArgumentParser(description="Fuse captions from video-only and napsack candidates")
     parser.add_argument("--video-only-name", required=True, help="Name of video-only candidate folder")
-    parser.add_argument("--pack-name", required=True, help="Name of pack candidate folder")
+    parser.add_argument("--napsack-name", required=True, help="Name of napsack candidate folder")
     parser.add_argument("--video-dir", required=True, help="Directory containing video chunk files")
     parser.add_argument("--output-dir", required=True, help="Directory to save fused captions")
     parser.add_argument("--api-key", help="Gemini API key (optional, uses GEMINI_API_KEY env var)")
@@ -459,7 +459,7 @@ if __name__ == "__main__":
 
     main(
         video_only_name=args.video_only_name,
-        pack_name=args.pack_name,
+        napsack_name=args.napsack_name,
         video_dir=args.video_dir,
         output_dir=args.output_dir,
         api_key=args.api_key

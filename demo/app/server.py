@@ -46,7 +46,7 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # Global mutable state
 _state: DemoState = DemoState()
 _ffmpeg_recorder: Optional[FFmpegRecorder] = None
-_pack_proc: Optional[asyncio.subprocess.Process] = None
+_napsack_proc: Optional[asyncio.subprocess.Process] = None
 
 # SSE event queue
 _log_queue: asyncio.Queue = asyncio.Queue()
@@ -131,13 +131,30 @@ async def set_session(body: dict):
     return JSONResponse(_state.to_json())
 
 
+@app.get("/api/sessions/list")
+async def list_sessions():
+    """List subdirectories of the working directory that look like sessions."""
+    base = REPO_ROOT
+    dirs: List[str] = []
+    for child in sorted(base.iterdir()):
+        if child.is_dir() and not child.name.startswith("."):
+            state_file = child / "state.json"
+            # Include dirs that already have a state.json or look like session dirs
+            if state_file.exists() or (child / "napsack_session").exists() or (child / "ffmpeg").exists():
+                dirs.append(str(child))
+    # Always include the default if it's not already in the list
+    if DEFAULT_SESSION_DIR not in dirs:
+        dirs.insert(0, DEFAULT_SESSION_DIR)
+    return JSONResponse({"sessions": dirs})
+
+
 # ---------------------------------------------------------------------------
 # Step 1: Recording
 # ---------------------------------------------------------------------------
 
 @app.post("/api/record/start")
 async def start_recording(body: dict):
-    global _state, _ffmpeg_recorder, _pack_proc
+    global _state, _ffmpeg_recorder, _napsack_proc
 
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
@@ -145,9 +162,9 @@ async def start_recording(body: dict):
         return JSONResponse({"status": "already_running"})
 
     session_dir = Path(_state.session_dir)
-    pack_session = session_dir / "pack_session"
+    napsack_session = session_dir / "napsack_session"
     ffmpeg_dir = session_dir / "ffmpeg"
-    pack_session.mkdir(parents=True, exist_ok=True)
+    napsack_session.mkdir(parents=True, exist_ok=True)
     ffmpeg_dir.mkdir(parents=True, exist_ok=True)
 
     max_res = body.get("max_res", [1920, 1080])
@@ -157,40 +174,41 @@ async def start_recording(body: dict):
     _ffmpeg_recorder = FFmpegRecorder(ffmpeg_dir)
     _ffmpeg_recorder.start()
 
-    # Start pack recorder as subprocess
-    _log("[record] Starting pack recorder…")
+    # Start napsack recorder as subprocess
+    _log("[record] Starting napsack recorder…")
     cmd = [
         sys.executable, "-m", "record",
         "--max-res", str(max_res[0]), str(max_res[1]),
-        "--session-dir", str(pack_session),
+        "--session-dir", str(napsack_session),
+        "--lossless"
     ]
-    _pack_proc = await asyncio.create_subprocess_exec(
+    _napsack_proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=str(REPO_ROOT),
     )
 
-    # Stream pack stdout to SSE in background
-    async def _stream_pack():
-        assert _pack_proc and _pack_proc.stdout
-        async for line in _pack_proc.stdout:
-            _log(f"[pack] {line.decode(errors='replace').rstrip()}")
-    asyncio.create_task(_stream_pack())
+    # Stream napsack stdout to SSE in background
+    async def _stream_napsack():
+        assert _napsack_proc and _napsack_proc.stdout
+        async for line in _napsack_proc.stdout:
+            _log(f"[napsack] {line.decode(errors='replace').rstrip()}")
+    asyncio.create_task(_stream_napsack())
 
     _state.recording.running = True
-    _state.recording.pack_session_dir = str(pack_session)
+    _state.recording.napsack_session_dir = str(napsack_session)
     _state.recording.ffmpeg_dir = str(ffmpeg_dir)
     _state.recording.start_time = time.time()
     _state.save()
 
     _log("[record] Both recorders started ✓")
-    return JSONResponse({"status": "started", "pack_session": str(pack_session), "ffmpeg_dir": str(ffmpeg_dir)})
+    return JSONResponse({"status": "started", "napsack_session": str(napsack_session), "ffmpeg_dir": str(ffmpeg_dir)})
 
 
 @app.post("/api/record/stop")
 async def stop_recording():
-    global _state, _ffmpeg_recorder, _pack_proc
+    global _state, _ffmpeg_recorder, _napsack_proc
 
     if not _state.recording.running:
         return JSONResponse({"status": "not_running"})
@@ -203,14 +221,14 @@ async def stop_recording():
         _log(f"[record] FFmpeg stopped. {len(meta)} monitor(s) saved.")
         _ffmpeg_recorder = None
 
-    # Stop pack (send SIGINT)
-    if _pack_proc and _pack_proc.returncode is None:
+    # Stop napsack (send SIGINT)
+    if _napsack_proc and _napsack_proc.returncode is None:
         try:
-            _pack_proc.terminate()
-            await asyncio.wait_for(_pack_proc.wait(), timeout=30)
+            _napsack_proc.terminate()
+            await asyncio.wait_for(_napsack_proc.wait(), timeout=30)
         except asyncio.TimeoutError:
-            _pack_proc.kill()
-        _pack_proc = None
+            _napsack_proc.kill()
+        _napsack_proc = None
 
     _state.recording.running = False
     _state.recording.end_time = time.time()
@@ -225,13 +243,20 @@ async def stop_recording():
 # ---------------------------------------------------------------------------
 
 @app.post("/api/process/{method}")
-async def process_method(method: str):
+async def process_method(method: str, request: Request):
     if method not in METHODS:
         raise HTTPException(status_code=400, detail=f"Unknown method: {method}. Valid: {METHODS}")
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
     if _state.processing.status.get(method) == "running":
         return JSONResponse({"status": "already_running"})
+
+    # Parse optional body
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    num_workers = body.get("num_workers", 4)
 
     # Dependency: split_compress_io requires split_compress to be done
     if method == "split_compress_io":
@@ -247,7 +272,7 @@ async def process_method(method: str):
     async def _run():
         from demo.app.processing import run_method
         try:
-            async for line in run_method(method, _state, session_dir):
+            async for line in run_method(method, _state, session_dir, label_workers=num_workers):
                 _log(line)
         except Exception as e:
             _log(f"[{method}] FAILED: {e}")
@@ -290,6 +315,28 @@ async def get_gt_data():
                 if line.strip():
                     data_entries.append(json.loads(line))
 
+    # Build candidate screenshot directories – data.jsonl may reference
+    # an old path (e.g. pack_session/screenshots/) that was renamed or moved.
+    # We check the original path first, then fall back to known directories.
+    _screenshot_dirs = [
+        fused_dir / "screenshots",                   # split_compress_io/screenshots
+        session_dir / "split_compress" / "screenshots",
+        session_dir / "napsack_session" / "screenshots",
+    ]
+
+    def _resolve_img(img_path: str) -> Optional[str]:
+        """Return a valid absolute screenshot path, or None."""
+        p = Path(img_path)
+        if p.exists():
+            return str(p)
+        # Try the same filename in known screenshot directories
+        fname = p.name
+        for d in _screenshot_dirs:
+            candidate = d / fname
+            if candidate.exists():
+                return str(candidate)
+        return None
+
     # Build 8-caption chunks
     chunk_size = 8
     chunks = []
@@ -300,12 +347,7 @@ async def get_gt_data():
         for j, cap in enumerate(chunk_caps):
             data_idx = i + j
             if data_idx < len(data_entries) and data_entries[data_idx].get("img"):
-                img_path = data_entries[data_idx]["img"]
-                # Verify file exists
-                if Path(img_path).exists():
-                    frames.append(img_path)
-                else:
-                    frames.append(None)
+                frames.append(_resolve_img(data_entries[data_idx]["img"]))
             else:
                 frames.append(None)
         chunks.append({"captions": chunk_caps, "frames": frames})
@@ -441,6 +483,7 @@ async def run_judge(body: dict):
     gt_path = Path(_state.gt.gt_captions_path)
     output_dir = session_dir / "judge"
     num_runs = body.get("runs", 3)
+    num_workers = body.get("num_workers", 4)
 
     _state.judge.status = "running"
     _state.save()
@@ -449,10 +492,11 @@ async def run_judge(body: dict):
         try:
             sys_path_entry = str(Path(__file__).parent.parent.parent / "demo")
             cmd = [
-                sys.executable, "-m", "demo.single_judge",
+                sys.executable, "-u", "-m", "demo.single_judge",
                 "--session-dir", str(session_dir),
                 "--output-dir", str(output_dir),
                 "--runs", str(num_runs),
+                "--num-workers", str(num_workers),
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -513,15 +557,36 @@ async def get_human_chunks():
                 gt_entries.append(json.loads(line))
     gt_chunks = [gt_entries[i:i+8] for i in range(0, len(gt_entries), 8)]
 
+    # Load split_compress_io data.jsonl and ffmpeg start for time alignment
+    from demo.single_judge import (
+        _load_method_chunks, _chunk_captions_by_gt,
+        _build_screenshot_time_map, _load_ffmpeg_start, _load_scio_data,
+    )
+
+    # Build screenshot timestamp map
+    screenshots_dir = None
+    for candidate_dir in [
+        session_dir / "napsack_session" / "screenshots",
+        session_dir / "split_compress" / "screenshots",
+    ]:
+        if candidate_dir.exists():
+            screenshots_dir = candidate_dir
+            break
+    screenshot_timestamps = _build_screenshot_time_map(screenshots_dir) if screenshots_dir else []
+
+    ffmpeg_start = _load_ffmpeg_start(session_dir)
+    scio_data = _load_scio_data(session_dir)
+
     # Build aligned method chunks
-    from demo.single_judge import _load_method_chunks, _chunk_captions_by_gt
     result_chunks = []
     for ci, gt_chunk in enumerate(gt_chunks):
         methods_data: Dict[str, List[Dict]] = {}
         for m in METHODS:
             raw = _load_method_chunks(session_dir, m)
             flat = [c for chunk in raw for c in chunk]
-            aligned = _chunk_captions_by_gt(flat, [gt_chunk])
+            aligned = _chunk_captions_by_gt(
+                flat, [gt_chunk], m, scio_data, screenshot_timestamps, ffmpeg_start,
+            )
             methods_data[m] = aligned[0] if aligned else []
 
         # Shuffle method order for blind presentation

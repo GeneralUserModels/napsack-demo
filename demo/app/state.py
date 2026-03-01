@@ -20,7 +20,7 @@ METHODS = ["naive", "split", "split_compress", "split_compress_io"]
 @dataclass
 class RecordingState:
     running: bool = False
-    pack_session_dir: Optional[str] = None       # path to pack session dir
+    napsack_session_dir: Optional[str] = None       # path to napsack session dir
     ffmpeg_dir: Optional[str] = None             # path to ffmpeg output dir
     start_time: Optional[float] = None
     end_time: Optional[float] = None

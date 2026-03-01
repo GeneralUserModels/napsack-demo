@@ -40,7 +40,7 @@ def _total_mp4_size_mb(directory: Path, exclude_master: bool = True) -> float:
 
 async def _stream_subprocess(cmd: List[str], cwd: Optional[str] = None) -> AsyncIterator[str]:
     """Run a subprocess and yield stdout/stderr lines as they arrive."""
-    env = {**os.environ}
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -63,7 +63,7 @@ async def _stream_subprocess(cmd: List[str], cwd: Optional[str] = None) -> Async
 def extract_frames_from_video(video_path: Path, out_dir: Path, fps: int = 1) -> Path:
     """
     Extract frames from an MP4 at `fps` frames/second into out_dir.
-    Files are named frame_000001.jpg, frame_000002.jpg, etc.
+    Files are named frame_000001.png, frame_000002.png, etc.
     Default 1fps matches Gemini's native sampling rate.
     Returns out_dir.
     """
@@ -72,8 +72,7 @@ def extract_frames_from_video(video_path: Path, out_dir: Path, fps: int = 1) -> 
         "ffmpeg", "-y",
         "-i", str(video_path),
         "-vf", f"fps={fps}",
-        "-q:v", "5",  # ~JPEG quality 70
-        str(out_dir / "frame_%06d.jpg"),
+        str(out_dir / "frame_%06d.png"),
     ]
     subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return out_dir
@@ -87,11 +86,12 @@ async def run_naive(
     state: DemoState,
     ffmpeg_dir: Path,
     session_dir: Path,
+    label_workers: int = 4,
 ) -> AsyncIterator[str]:
     """
     Naive: whole-video Gemini captioning (no splitting, no compression).
     Frames are extracted at 1fps from the ffmpeg screen recording, then
-    labelled with a very large chunk duration to avoid splitting.
+    labelled with 10-min chunk duration (max 12 min tolerance).
     Gemini samples at 1fps natively, so all extracted frames are processed.
     """
     out_dir = session_dir / "naive"
@@ -110,14 +110,27 @@ async def run_naive(
     yield f"[naive] Extracting frames from {output_mp4.name}…"
     extract_frames_from_video(output_mp4, screenshots_dir)
 
-    yield "[naive] Running label pipeline (no split)…"
+    # Determine chunk duration: aim for 10-min chunks, tolerate up to 12 min.
+    # If total video ≤ 12 min, use a single chunk (no splitting needed).
+    num_frames = len(list(screenshots_dir.glob("frame_*.png")))
+    total_seconds = num_frames  # 1 fps → 1 frame per second
+    if total_seconds <= 720:  # ≤ 12 minutes → single chunk
+        chunk_dur = str(total_seconds + 1)
+        yield f"[naive] Video is {total_seconds}s (≤12 min) → single chunk"
+    else:
+        chunk_dur = "600"  # 10-minute chunks
+        n_chunks = -(-total_seconds // 600)  # ceil division
+        yield f"[naive] Video is {total_seconds}s → splitting into ~{n_chunks} chunks of ≤10 min"
+
+    yield "[naive] Running label pipeline…"
     cmd = _uv_run(
         "-m", "label",
         "--session", str(out_dir),
         "--screenshots-only",
-        "--chunk-duration", "99999",
+        "--chunk-duration", chunk_dur,
         "--client", "gemini",
         "--model", "gemini-3-flash-preview",
+        "--label-workers", str(label_workers),
     )
     async for line in _stream_subprocess(cmd):
         yield f"[naive] {line}"
@@ -133,6 +146,7 @@ async def run_split(
     state: DemoState,
     ffmpeg_dir: Path,
     session_dir: Path,
+    label_workers: int = 4,
 ) -> AsyncIterator[str]:
     """
     Split: same as naive but split into 1-min chunks before labelling.
@@ -160,6 +174,7 @@ async def run_split(
         "--chunk-duration", "60",
         "--client", "gemini",
         "--model", "gemini-3-flash-preview",
+        "--label-workers", str(label_workers),
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split] {line}"
@@ -173,42 +188,43 @@ async def run_split(
 
 async def run_split_compress(
     state: DemoState,
-    pack_session_dir: Path,
+    napsack_session_dir: Path,
     session_dir: Path,
+    label_workers: int = 4,
 ) -> AsyncIterator[str]:
     """
-    Split + compress: use pack screenshots (event-driven, already compressed)
+    Split + compress: use napsack screenshots (event-driven, already compressed)
     and build 1-min chunk videos, then label with Gemini.
     Data files are copied into the method's own directory so label outputs
-    stay isolated from the original pack_session.
+    stay isolated from the original napsack_session.
     """
     import shutil
 
     out_dir = session_dir / "split_compress"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pack_screenshots = pack_session_dir / "screenshots"
-    if not pack_screenshots.exists():
-        yield "[split_compress] ERROR: pack screenshots dir not found"
+    napsack_screenshots = napsack_session_dir / "screenshots"
+    if not napsack_screenshots.exists():
+        yield "[split_compress] ERROR: napsack screenshots dir not found"
         state.processing.status["split_compress"] = "error"
         state.processing.errors["split_compress"] = "screenshots dir missing"
         state.save()
         return
 
-    # Copy pack screenshots into our own directory
+    # Copy napsack screenshots into our own directory
     local_screenshots = out_dir / "screenshots"
     if local_screenshots.exists():
         shutil.rmtree(local_screenshots)
-    yield "[split_compress] Copying pack screenshots → split_compress/screenshots …"
-    shutil.copytree(str(pack_screenshots), str(local_screenshots))
+    yield "[split_compress] Copying napsack screenshots → split_compress/screenshots …"
+    shutil.copytree(str(napsack_screenshots), str(local_screenshots))
 
     # Copy aggregations.jsonl if present
-    agg_src = pack_session_dir / "aggregations.jsonl"
+    agg_src = napsack_session_dir / "aggregations.jsonl"
     if agg_src.exists():
         shutil.copy2(str(agg_src), str(out_dir / "aggregations.jsonl"))
 
     # Point label at our isolated directory
-    yield "[split_compress] Running label pipeline on pack screenshots (60 s chunks)…"
+    yield "[split_compress] Running label pipeline on napsack screenshots (60 s chunks)…"
     cmd = _uv_run(
         "-m", "label",
         "--session", str(out_dir),
@@ -216,6 +232,7 @@ async def run_split_compress(
         "--chunk-duration", "60",
         "--client", "gemini",
         "--model", "gemini-3-flash-preview",
+        "--label-workers", str(label_workers),
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split_compress] {line}"
@@ -227,7 +244,7 @@ async def run_split_compress(
         yield "[split_compress] Removed redundant master.mp4"
 
     state.processing.output_dirs["split_compress"] = str(out_dir)
-    # MP4 size = chunk videos built from pack screenshots
+    # MP4 size = chunk videos built from napsack screenshots
     state.processing.mp4_sizes_mb["split_compress"] = _total_mp4_size_mb(out_dir)
     state.processing.status["split_compress"] = "done"
     state.save()
@@ -236,14 +253,15 @@ async def run_split_compress(
 
 async def run_split_compress_io(
     state: DemoState,
-    pack_session_dir: Path,
+    napsack_session_dir: Path,
     session_dir: Path,
+    label_workers: int = 4,
 ) -> AsyncIterator[str]:
     """
-    Split + compress + IO: full pack labelling (screenshots + events), then
-    fuse with split_compress video-only captions via pack_fuse.py.
+    Split + compress + IO: full napsack labelling (screenshots + events), then
+    fuse with split_compress video-only captions via napsack_fuse.py.
     Data files are copied into the method's own directory so label outputs
-    stay isolated from the original pack_session.
+    stay isolated from the original napsack_session.
     """
     import shutil
 
@@ -252,34 +270,35 @@ async def run_split_compress_io(
     fused_dir = out_dir / "fused"
     fused_dir.mkdir(parents=True, exist_ok=True)
 
-    pack_screenshots = pack_session_dir / "screenshots"
-    if not pack_screenshots.exists():
-        yield "[split_compress_io] ERROR: pack screenshots dir not found"
+    napsack_screenshots = napsack_session_dir / "screenshots"
+    if not napsack_screenshots.exists():
+        yield "[split_compress_io] ERROR: napsack screenshots dir not found"
         state.processing.status["split_compress_io"] = "error"
         state.processing.errors["split_compress_io"] = "screenshots dir missing"
         state.save()
         return
 
-    # Copy pack data into our own directory
+    # Copy napsack data into our own directory
     local_screenshots = out_dir / "screenshots"
     if local_screenshots.exists():
         shutil.rmtree(local_screenshots)
-    yield "[split_compress_io] Copying pack screenshots → split_compress_io/screenshots …"
-    shutil.copytree(str(pack_screenshots), str(local_screenshots))
+    yield "[split_compress_io] Copying napsack screenshots → split_compress_io/screenshots …"
+    shutil.copytree(str(napsack_screenshots), str(local_screenshots))
 
     # Copy aggregations.jsonl if present
-    agg_src = pack_session_dir / "aggregations.jsonl"
+    agg_src = napsack_session_dir / "aggregations.jsonl"
     if agg_src.exists():
         shutil.copy2(str(agg_src), str(out_dir / "aggregations.jsonl"))
 
     # Step 1: label our isolated copy with full IO context
-    yield "[split_compress_io] Running full pack label (screenshots + events)…"
+    yield "[split_compress_io] Running full napsack label (screenshots + events)…"
     cmd = _uv_run(
         "-m", "label",
         "--session", str(out_dir),
         "--chunk-duration", "60",
         "--client", "gemini",
         "--model", "gemini-3-flash-preview",
+        "--label-workers", str(label_workers),
     )
     async for line in _stream_subprocess(cmd):
         yield f"[split_compress_io] {line}"
@@ -293,15 +312,15 @@ async def run_split_compress_io(
     # split_compress output dir (video-only captions already produced)
     sc_dir = state.processing.output_dirs.get("split_compress") or str(session_dir / "split_compress")
 
-    # Step 2: fuse video-only + pack captions
-    yield "[split_compress_io] Fusing captions with pack_fuse.py…"
+    # Step 2: fuse video-only + napsack captions
+    yield "[split_compress_io] Fusing captions with napsack_fuse.py…"
     demo_dir = Path(__file__).parent.parent  # demo/
-    fuse_script = demo_dir / "pack_fuse.py"
+    fuse_script = demo_dir / "napsack_fuse.py"
     # video chunks were built by the label pipeline inside out_dir (isolated)
     cmd2 = [
         sys.executable, str(fuse_script),
         "--video-only-name", sc_dir,
-        "--pack-name", str(out_dir),
+        "--napsack-name", str(out_dir),
         "--video-dir", str(out_dir),
         "--output-dir", str(fused_dir),
     ]
@@ -323,8 +342,9 @@ async def run_method(
     method: str,
     state: DemoState,
     session_dir: Path,
+    label_workers: int = 4,
 ) -> AsyncIterator[str]:
-    pack_dir = Path(state.recording.pack_session_dir)
+    napsack_dir = Path(state.recording.napsack_session_dir)
     ffmpeg_dir = Path(state.recording.ffmpeg_dir)
 
     state.processing.status[method] = "running"
@@ -332,16 +352,16 @@ async def run_method(
     state.save()
     try:
         if method == "naive":
-            async for line in run_naive(state, ffmpeg_dir, session_dir):
+            async for line in run_naive(state, ffmpeg_dir, session_dir, label_workers):
                 yield line
         elif method == "split":
-            async for line in run_split(state, ffmpeg_dir, session_dir):
+            async for line in run_split(state, ffmpeg_dir, session_dir, label_workers):
                 yield line
         elif method == "split_compress":
-            async for line in run_split_compress(state, pack_dir, session_dir):
+            async for line in run_split_compress(state, napsack_dir, session_dir, label_workers):
                 yield line
         elif method == "split_compress_io":
-            async for line in run_split_compress_io(state, pack_dir, session_dir):
+            async for line in run_split_compress_io(state, napsack_dir, session_dir, label_workers):
                 yield line
         else:
             raise ValueError(f"Unknown method: {method}")

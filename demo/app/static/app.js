@@ -4,11 +4,28 @@
 
 // ── State ──────────────────────────────────────────────────────────────────
 let serverState = {};
-let gtData = null;          // {chunks, existing_gt, gt_videos, num_chunks}
+let gtData = null;
 let gtChunkIdx = 0;
 let frameIdx = 0;
-let humanChunks = null;     // array from /api/human/chunks
+let humanChunks = null;
 let humanChunkIdx = 0;
+let activeStep = null;
+
+// ── Lightbox ───────────────────────────────────────────────────────────────
+function openLightbox(src) {
+  const overlay = document.getElementById('lightbox-overlay');
+  const img = document.getElementById('lightbox-img');
+  img.src = src;
+  overlay.classList.remove('hidden');
+}
+
+function closeLightbox() {
+  document.getElementById('lightbox-overlay').classList.add('hidden');
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeLightbox();
+});
 
 // ── SSE Log ────────────────────────────────────────────────────────────────
 const logEl = document.getElementById('log-console');
@@ -25,40 +42,114 @@ function clearLog() { logEl.innerHTML = ''; }
 
 (function initSSE() {
   const es = new EventSource('/events');
-  es.addEventListener('log', e => appendLog(e.data));
+  es.addEventListener('log', e => {
+    const msg = e.data;
+    // Intercept __progress__ messages (sent by single_judge.py, double-wrapped by server)
+    // Format: [judge] [judge] __progress__ N M label
+    const pm = msg.match(/^\[([a-z_]+)\] (?:\[[a-z_]+\] )?__progress__ (\d+) (\d+) (.*)$/);
+    if (pm) { _updateProgress(pm[1], parseInt(pm[2]), parseInt(pm[3]), pm[4]); return; }
+    // Intercept CHUNK_PROGRESS messages (sent by processor.py)
+    const cp = msg.match(/^\[([a-z_]+)\] CHUNK_PROGRESS: (\d+)\/(\d+)$/);
+    if (cp) { _updateProgress(cp[1], parseInt(cp[2]), parseInt(cp[3]), `chunk ${cp[2]}/${cp[3]}`); return; }
+    appendLog(msg);
+  });
   es.addEventListener('error', () => appendLog('[SSE] connection lost', true));
 })();
+
+// ── Progress bars ──────────────────────────────────────────────────────────
+function _updateProgress(key, done, total, label) {
+  const pct = total > 0 ? Math.round(done / total * 100) : 0;
+  if (key === 'judge') {
+    const wrap = document.getElementById('judge-progress-wrap');
+    const fill = document.getElementById('judge-progress-fill');
+    const lbl  = document.getElementById('judge-progress-label');
+    if (wrap) wrap.classList.remove('hidden');
+    if (fill) { fill.classList.remove('indeterminate'); fill.style.width = pct + '%'; }
+    if (lbl)  lbl.textContent = `${pct}% – ${label}`;
+  } else {
+    const wrap = document.getElementById(`progress-wrap-${key}`);
+    const fill = document.getElementById(`progress-${key}`);
+    if (wrap) wrap.classList.remove('hidden');
+    if (fill) { fill.classList.remove('indeterminate'); fill.style.width = pct + '%'; }
+  }
+}
+
+// ── Step card selection ────────────────────────────────────────────────────
+function selectStep(step) {
+  activeStep = step;
+  // Update card highlights
+  document.querySelectorAll('.step-card').forEach(c => {
+    c.classList.toggle('active', parseInt(c.dataset.step) === step);
+  });
+  // Show/hide canvases
+  document.querySelectorAll('.canvas').forEach(c => c.classList.add('hidden'));
+  const canvas = document.getElementById(`canvas-${step}`);
+  if (canvas) canvas.classList.remove('hidden');
+}
+
+// ── Session directory dropdown ─────────────────────────────────────────────
+async function loadSessionList() {
+  try {
+    const res = await fetch('/api/sessions/list');
+    const data = await res.json();
+    const sel = document.getElementById('session-dropdown');
+    sel.innerHTML = '<option value="">— Select session —</option>';
+    (data.sessions || []).forEach(s => {
+      const opt = document.createElement('option');
+      opt.value = s;
+      // Show just the directory name for readability
+      opt.textContent = s.split('/').pop() || s;
+      sel.appendChild(opt);
+    });
+  } catch (_) {}
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  loadSessionList();
+
+  document.getElementById('session-dropdown').addEventListener('change', (e) => {
+    const val = e.target.value;
+    if (val) {
+      document.getElementById('session-dir-input').value = val;
+      loadSession();
+    }
+  });
+});
 
 // ── Polling ────────────────────────────────────────────────────────────────
 let _initialSessionLoaded = false;
 let _appRevealed = false;
+
 async function pollStatus() {
   try {
     const res = await fetch('/api/status');
     serverState = await res.json();
     applyState(serverState);
 
-    // Hide loading overlay and reveal app on first successful response
     if (!_appRevealed) {
       _appRevealed = true;
       document.getElementById('loading-overlay').classList.add('hidden');
       document.getElementById('app-wrapper').classList.remove('hidden');
     }
 
-    // On very first poll, pre-populate input and auto-load default session
-    const inp = document.getElementById('session-dir-input');
-    if (!_initialSessionLoaded && serverState.default_session_dir) {
+    if (!_initialSessionLoaded) {
       _initialSessionLoaded = true;
-      if (!inp.value) inp.value = serverState.default_session_dir;
-      // Auto-load if no session is active yet
-      if (!serverState.session_dir) {
-        await loadSession();
+      const inp = document.getElementById('session-dir-input');
+      const sel = document.getElementById('session-dropdown');
+      if (serverState.session_dir) {
+        // Server already has an active session (restored from state.json) – sync UI
+        inp.value = serverState.session_dir;
+        sel.value = serverState.session_dir;
+        document.getElementById('session-status').textContent =
+          `✓ ${serverState.session_dir.split('/').pop()}`;
+      } else if (serverState.default_session_dir) {
+        // Just pre-fill the input, don't auto-load
+        inp.value = serverState.default_session_dir;
       }
     }
   } catch (_) {}
 }
 setInterval(pollStatus, 3000);
-// Defer first poll so the loading overlay has time to paint
 setTimeout(pollStatus, 50);
 
 function applyState(s) {
@@ -74,15 +165,19 @@ function applyState(s) {
     recBtn.textContent = '⏹ Stop Recording';
     recBtn.classList.add('btn-red');
     recStatus.textContent = '🔴 Recording in progress…';
+    _setBadge(1, 'running', '●');
   } else {
     recBtn.textContent = '▶ Start Recording';
-    recStatus.textContent = s.recording?.end_time
-      ? `✓ Stopped at ${new Date(s.recording.end_time * 1000).toLocaleTimeString()}`
-      : '';
+    if (s.recording?.end_time) {
+      recStatus.textContent = `✓ Stopped at ${new Date(s.recording.end_time * 1000).toLocaleTimeString()}`;
+      _setBadge(1, 'done', '✓');
+    }
   }
 
   // Processing statuses
   const methods = ['naive', 'split', 'split_compress', 'split_compress_io'];
+  let allDone = true;
+  let anyRunning = false;
   methods.forEach(m => {
     const st = (s.processing?.status || {})[m] || 'pending';
     const sz = (s.processing?.mp4_sizes_mb || {})[m];
@@ -93,14 +188,79 @@ function applyState(s) {
       el.className = 'method-status ' + st;
     }
     if (szEl) szEl.textContent = sz != null ? `${sz} MB` : '–';
+    if (st !== 'done') allDone = false;
+    if (st === 'running') anyRunning = true;
+    // Progress bar
+    const wrap = document.getElementById(`progress-wrap-${m}`);
+    const fill = document.getElementById(`progress-${m}`);
+    if (wrap && fill) {
+      if (st === 'pending') {
+        wrap.classList.add('hidden');
+        fill.style.width = '0%';
+        fill.className = 'method-progress-fill';
+      } else if (st === 'running') {
+        wrap.classList.remove('hidden');
+        if (!fill.style.width || fill.style.width === '0%') {
+          fill.classList.add('indeterminate');
+        }
+      } else if (st === 'done') {
+        wrap.classList.remove('hidden');
+        fill.classList.remove('indeterminate');
+        fill.className = 'method-progress-fill';
+        fill.style.width = '100%';
+      } else if (st === 'error') {
+        wrap.classList.remove('hidden');
+        fill.classList.remove('indeterminate');
+        fill.className = 'method-progress-fill error-fill';
+        fill.style.width = '100%';
+      }
+    }
   });
+  if (allDone && methods.some(m => (s.processing?.status || {})[m])) _setBadge(2, 'done', '✓');
+  else if (anyRunning) _setBadge(2, 'running', '●');
+
+  // GT badge
+  if (s.gt?.done) _setBadge(3, 'done', '✓');
 
   // Judge status
   const judgeStatus = document.getElementById('judge-status');
   if (judgeStatus && s.judge) {
     const js = s.judge.status || 'pending';
     judgeStatus.textContent = js === 'done' ? '✓ Judge complete' : js === 'running' ? '⏳ Running…' : js;
+    if (js === 'done') _setBadge(4, 'done', '✓');
+    else if (js === 'running') _setBadge(4, 'running', '●');
+    // Judge progress bar
+    const jWrap = document.getElementById('judge-progress-wrap');
+    const jFill = document.getElementById('judge-progress-fill');
+    const jLbl  = document.getElementById('judge-progress-label');
+    if (jWrap && jFill) {
+      if (js === 'pending') {
+        jWrap.classList.add('hidden');
+        jFill.style.width = '0%';
+        jFill.className = 'judge-progress-fill';
+      } else if (js === 'running') {
+        jWrap.classList.remove('hidden');
+        if (!jFill.style.width || jFill.style.width === '0%') {
+          jFill.classList.add('indeterminate');
+        }
+      } else if (js === 'done') {
+        jWrap.classList.remove('hidden');
+        jFill.classList.remove('indeterminate');
+        jFill.style.width = '100%';
+        if (jLbl && jLbl.textContent === '') jLbl.textContent = 'Complete';
+      }
+    }
   }
+
+  // Human eval badge
+  if (s.human_eval?.status === 'done') _setBadge(5, 'done', '✓');
+}
+
+function _setBadge(step, cls, text) {
+  const badge = document.getElementById(`badge-${step}`);
+  if (!badge) return;
+  badge.className = 'step-badge ' + cls;
+  badge.textContent = text;
 }
 
 // ── Session ────────────────────────────────────────────────────────────────
@@ -114,13 +274,22 @@ async function loadSession() {
   const data = await res.json();
   serverState = data;
   applyState(data);
-  document.getElementById('session-status').textContent = `✓ Session: ${dir}`;
+  document.getElementById('session-status').textContent = `✓ ${dir.split('/').pop()}`;
   appendLog(`[session] Loaded: ${dir}`);
+
+  // Sync dropdown selection
+  const sel = document.getElementById('session-dropdown');
+  sel.value = dir;
+
+  // Refresh session list in case this was a new session
+  loadSessionList();
+
+  // Auto-select step 1 if none selected
+  if (!activeStep) selectStep(1);
 }
 
 // ── Step 1: Recording ──────────────────────────────────────────────────────
 async function toggleRecording() {
-  // Ensure session is loaded before starting
   if (!serverState?.session_dir) {
     await loadSession();
     if (!serverState?.session_dir) {
@@ -130,8 +299,8 @@ async function toggleRecording() {
   }
   if (serverState?.recording?.running) {
     const res = await fetch('/api/record/stop', { method: 'POST' });
-    if (!res.ok) { appendLog('[record] Stop failed: ' + await res.text(), true); }
-    else { appendLog('[record] Stop requested'); }
+    if (!res.ok) appendLog('[record] Stop failed: ' + await res.text(), true);
+    else appendLog('[record] Stop requested');
   } else {
     const w = parseInt(document.getElementById('max-res-w').value) || 1920;
     const h = parseInt(document.getElementById('max-res-h').value) || 1080;
@@ -139,15 +308,14 @@ async function toggleRecording() {
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ max_res: [w, h] })
     });
-    if (!res.ok) { appendLog('[record] Start failed: ' + await res.text(), true); }
-    else { appendLog('[record] Start requested'); }
+    if (!res.ok) appendLog('[record] Start failed: ' + await res.text(), true);
+    else appendLog('[record] Start requested');
   }
   await pollStatus();
 }
 
 // ── Step 2: Processing ─────────────────────────────────────────────────────
 async function runMethod(method) {
-  // Enforce dependency: split_compress_io requires split_compress to be done
   if (method === 'split_compress_io') {
     const scStatus = (serverState.processing?.status || {})['split_compress'];
     if (scStatus !== 'done') {
@@ -156,7 +324,12 @@ async function runMethod(method) {
       return;
     }
   }
-  const res = await fetch(`/api/process/${method}`, { method: 'POST' });
+  const workers = parseInt(document.getElementById('caption-workers').value) || 4;
+  const res = await fetch(`/api/process/${method}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ num_workers: workers })
+  });
   const data = await res.json();
   appendLog(`[process] ${method}: ${data.status}`);
   await pollStatus();
@@ -170,7 +343,6 @@ async function loadGT() {
   gtChunkIdx = 0;
   frameIdx = 0;
 
-  // Pre-fill from existing GT if available
   if (gtData.existing_gt && gtData.existing_gt.length > 0) {
     const chunkSize = 8;
     for (let i = 0; i < gtData.chunks.length; i++) {
@@ -189,11 +361,9 @@ function renderGTChunk() {
   const total = gtData.chunks.length;
   document.getElementById('gt-chunk-indicator').textContent = `Chunk ${gtChunkIdx + 1} / ${total}`;
 
-  // Fill textarea with one caption per line
   const lines = chunk.captions.map(c => c.caption ?? '');
   document.getElementById('gt-textarea').value = lines.join('\n');
 
-  // Show first frame
   frameIdx = 0;
   renderGTFrame();
 }
@@ -219,12 +389,12 @@ function renderGTFrame() {
   if (frame) {
     imgEl.src = `/api/media/${encodeURIComponent(frame)}`;
     imgEl.style.display = 'block';
+    imgEl.onclick = () => openLightbox(imgEl.src);
   } else {
     imgEl.src = '';
     imgEl.style.display = 'none';
   }
 
-  // Show which caption this frame corresponds to
   const cap = chunk.captions?.[idx];
   if (cap) {
     const start = cap.start ?? cap.start_time ?? '?';
@@ -255,7 +425,6 @@ function _highlightTextareaLine(lineIdx) {
   const ta = document.getElementById('gt-textarea');
   const lines = ta.value.split('\n');
   if (lineIdx < 0 || lineIdx >= lines.length) return;
-  // Calculate character offsets for the target line
   let start = 0;
   for (let i = 0; i < lineIdx; i++) start += lines[i].length + 1;
   const end = start + lines[lineIdx].length;
@@ -263,7 +432,6 @@ function _highlightTextareaLine(lineIdx) {
   ta.setSelectionRange(start, end);
 }
 
-// When clicking into the textarea, sync the frame to the cursor's line
 document.addEventListener('DOMContentLoaded', () => {
   const ta = document.getElementById('gt-textarea');
   if (ta) {
@@ -281,37 +449,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
 function prevGTChunk() {
   if (!gtData || gtChunkIdx === 0) return;
-  _syncTextareaToChunk(); // save edits before navigating
+  _syncTextareaToChunk();
   gtChunkIdx--; frameIdx = 0; renderGTChunk();
 }
 function nextGTChunk() {
   if (!gtData || gtChunkIdx >= gtData.chunks.length - 1) return;
-  _syncTextareaToChunk(); // save edits before navigating
+  _syncTextareaToChunk();
   gtChunkIdx++; frameIdx = 0; renderGTChunk();
 }
 
 function _syncTextareaToChunk() {
-  // Sync current textarea content back into gtData
   if (!gtData) return;
   const ta = document.getElementById('gt-textarea');
   const lines = ta.value.split('\n').filter(l => l.trim() !== '');
   const chunk = gtData.chunks[gtChunkIdx];
-  // Update captions — keep original start/end times, just update caption text
   const updatedCaptions = [];
   for (let i = 0; i < lines.length; i++) {
     if (i < chunk.captions.length) {
-      // Update existing caption's text
       const orig = chunk.captions[i];
       updatedCaptions.push({ ...orig, caption: lines[i] });
     } else {
-      // New line added — create a caption with no timestamps
       updatedCaptions.push({ start: '', end: '', caption: lines[i] });
     }
   }
   chunk.captions = updatedCaptions;
 }
 
-// Keyboard navigation for frames (only when not in an input/textarea)
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
   if (e.key === 'ArrowLeft') prevGTFrame();
@@ -320,8 +483,7 @@ document.addEventListener('keydown', e => {
 
 async function saveGT() {
   if (!gtData) return;
-  _syncTextareaToChunk(); // sync current chunk first
-  // Flatten all chunks
+  _syncTextareaToChunk();
   const allCaptions = gtData.chunks.flatMap(c => c.captions);
   const res = await fetch('/api/gt/save', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -335,9 +497,10 @@ async function saveGT() {
 // ── Step 4: LLM Judge ──────────────────────────────────────────────────────
 async function runJudge() {
   const runs = parseInt(document.getElementById('judge-runs').value) || 3;
+  const workers = parseInt(document.getElementById('judge-workers').value) || 4;
   const res = await fetch('/api/judge/run', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ runs })
+    body: JSON.stringify({ runs, num_workers: workers })
   });
   const data = await res.json();
   appendLog(`[judge] ${data.status}`);
@@ -392,23 +555,17 @@ function renderHumanChunk() {
       <div class="rank-input">
         <label>Rank (1=best):</label>
         <input type="number" min="1" max="4" id="rank-slot-${cand.slot}"
-               data-slot="${cand.slot}" data-method="${cand.method_hidden}" />
+               data-slot="${cand.slot}" data-method="${cand.method_hidden}"
+               oninput="onRankInput()" />
+        <span class="rank-saved" id="rank-saved-${cand.slot}"></span>
       </div>
     `;
     panel.appendChild(card);
   });
 }
 
-function prevHumanChunk() {
-  if (!humanChunks || humanChunkIdx === 0) return;
-  humanChunkIdx--; renderHumanChunk();
-}
-function nextHumanChunk() {
-  if (!humanChunks || humanChunkIdx >= humanChunks.length - 1) return;
-  humanChunkIdx++; renderHumanChunk();
-}
-
-async function submitRanking() {
+/** Auto-save ranking when all 4 rank inputs are filled */
+async function onRankInput() {
   if (!humanChunks) return;
   const chunk = humanChunks[humanChunkIdx];
   const slots = chunk.candidates.map(cand => {
@@ -419,18 +576,34 @@ async function submitRanking() {
       rank: inp ? parseInt(inp.value) || null : null,
     };
   });
-  const missing = slots.filter(s => s.rank === null);
-  if (missing.length > 0) {
-    document.getElementById('human-status').textContent = '⚠️ Please enter a rank for every candidate.';
-    return;
-  }
+
+  const filled = slots.filter(s => s.rank !== null);
+  if (filled.length < chunk.candidates.length) return; // not all filled yet
+
+  // All filled → auto-save
   const res = await fetch('/api/human/rank', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ chunk_idx: humanChunkIdx, slots })
   });
   const data = await res.json();
-  document.getElementById('human-status').textContent = `✓ Saved chunk ${humanChunkIdx + 1} (total: ${data.total})`;
-  appendLog(`[human] Chunk ${humanChunkIdx + 1} ranked`);
+  document.getElementById('human-status').textContent =
+    `✓ Auto-saved chunk ${humanChunkIdx + 1} (total: ${data.total})`;
+  appendLog(`[human] Chunk ${humanChunkIdx + 1} ranked (auto-saved)`);
+
+  // Show saved indicator on each input
+  chunk.candidates.forEach(cand => {
+    const indicator = document.getElementById(`rank-saved-${cand.slot}`);
+    if (indicator) indicator.textContent = '✓';
+  });
+}
+
+function prevHumanChunk() {
+  if (!humanChunks || humanChunkIdx === 0) return;
+  humanChunkIdx--; renderHumanChunk();
+}
+function nextHumanChunk() {
+  if (!humanChunks || humanChunkIdx >= humanChunks.length - 1) return;
+  humanChunkIdx++; renderHumanChunk();
 }
 
 async function finalizeHuman() {
@@ -476,55 +649,6 @@ async function loadResults() {
     `;
     document.getElementById('correlation-container').classList.remove('hidden');
   }
-
-  // LaTeX
-  buildLatex(methods, sizes, judgeData, data.judge?.num_gt_chunks, humanRanks);
-}
-
-function buildLatex(methods, sizes, judgeData, numGT, humanRanks) {
-  const hasRanks = humanRanks && Object.keys(humanRanks).length > 0;
-  const methodLabels = {
-    naive: 'naive',
-    split: '+ split',
-    split_compress: '+ split + compress',
-    split_compress_io: '+ split + compress + IO',
-  };
-  let rows = methods.map(m => {
-    const jd = judgeData[m] || {};
-    const mean = jd.mean != null ? jd.mean.toFixed(2) : '?';
-    const se = jd.bootstrap_se != null ? jd.bootstrap_se.toFixed(2) : '?';
-    const sz = sizes[m] != null ? sizes[m].toFixed(0) : '?';
-    const label = methodLabels[m] || m;
-    const hrule = m === 'naive' ? '\\midrule\n' : '';
-    const rankCol = hasRanks
-      ? ` & ${humanRanks[m] != null ? humanRanks[m].toFixed(2) : '?'}`
-      : '';
-    return `${hrule}        ${label} & $${mean} \\pm ${se}$${rankCol} & \\SI{${sz}}{\\mega\\byte} \\\\`;
-  }).join('\n');
-
-  const nStr = numGT != null ? `$n={${numGT} \\cdot 8}$` : '$n={?}$';
-  const rankHeader = hasRanks ? ' & Avg Rank ($\\downarrow$)' : '';
-  const colSpec = hasRanks ? 'lrrr' : 'lrr';
-  const latex = `\\begin{table}[]
-    \\centering
-    \\begin{tabular}{${colSpec}}
-        \\toprule
-        Method & Judge Score ($\\uparrow$)${rankHeader} & Size ($\\downarrow$) \\\\
-        \\midrule
-${rows}
-        \\bottomrule
-    \\end{tabular}
-    \\caption{\\textbf{NAPsack reduces the amount of data we have to save for effective captioning by 70\\% without compromising quality}. When comparing to ${nStr} ground truth trajectories, our LLM-as-a-judge scores (in $[0,1]$; $\\pm$ bootstrap standard error) show that accuracy increases most when splitting the data into smaller chunks for the VLM to label. Event-driven compression (where frames are saved only when a user interacts with their computer) yields the best data efficiency.}
-    \\label{tab:pack-eval}
-\\end{table}`;
-
-  document.getElementById('latex-output').textContent = latex;
-  document.getElementById('latex-container').classList.remove('hidden');
-}
-
-function copyLatex() {
-  const text = document.getElementById('latex-output').textContent;
-  navigator.clipboard.writeText(text).then(() => appendLog('[latex] Copied to clipboard'));
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────

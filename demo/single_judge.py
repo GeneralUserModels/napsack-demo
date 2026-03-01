@@ -10,6 +10,7 @@ Demo-mode CLI (--session-dir):
 Legacy standalone mode: same as before (no --session-dir).
 """
 
+import bisect
 import json
 import os
 import random
@@ -17,6 +18,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import google.generativeai as genai
 
@@ -99,7 +101,7 @@ class CaptionLoader:
         """Load compression without key (chunk_NNN/captions.jsonl)."""
         return self.load_from_chunk_dirs(name)
 
-    def load_pack(self, name: str = "pack") -> List[List[Dict]]:
+    def load_napsack(self, name: str = "napsack") -> List[List[Dict]]:
         """Load compression with key and chunk into 10-minute segments."""
         data_file = self.base_path / name / "data.jsonl"
         all_entries = self._load_jsonl(data_file)
@@ -150,11 +152,13 @@ class GeminiEvaluator:
         prompt_file: Optional[str] = None,
         results_file: str = "gemini_evaluation_results.json",
     ):
+        import threading as _th
         self.results_file = results_file
         self.methods = methods
+        self._lock = _th.Lock()
 
         genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel("gemini-2.0-flash")
+        self.model = genai.GenerativeModel("gemini-3-flash-preview")
 
         self.results = self._load_results()
         if prompt_file and Path(prompt_file).exists():
@@ -180,8 +184,9 @@ class GeminiEvaluator:
             json.dump(save_data, f, indent=2)
 
     def is_pair_evaluated(self, chunk_idx: int, method: str, run: int = 0) -> bool:
-        pair_id = f"{chunk_idx}_{method}_run{run}"
-        return pair_id in set(self.results.get("completed_pairs", []))
+        with self._lock:
+            pair_id = f"{chunk_idx}_{method}_run{run}"
+            return pair_id in set(self.results.get("completed_pairs", []))
 
     def format_captions_for_eval(self, captions: List[Dict]) -> str:
         lines = []
@@ -227,13 +232,14 @@ class GeminiEvaluator:
                     "error": str(e), "evaluation": None}
 
     def add_evaluation(self, chunk_idx: int, method: str, result: Dict, run: int = 0):
-        self.results["evaluations"].append(result)
-        pair_id = f"{chunk_idx}_{method}_run{run}"
-        if "completed_pairs" not in self.results:
-            self.results["completed_pairs"] = set()
-        self.results["completed_pairs"] = set(self.results["completed_pairs"])
-        self.results["completed_pairs"].add(pair_id)
-        self._save_results()
+        with self._lock:
+            self.results["evaluations"].append(result)
+            pair_id = f"{chunk_idx}_{method}_run{run}"
+            if "completed_pairs" not in self.results:
+                self.results["completed_pairs"] = set()
+            self.results["completed_pairs"] = set(self.results["completed_pairs"])
+            self.results["completed_pairs"].add(pair_id)
+            self._save_results()
 
     def get_statistics(self) -> Dict:
         scores: Dict[str, List[float]] = defaultdict(list)
@@ -289,31 +295,216 @@ def _load_method_chunks(session_dir: Path, method: str) -> List[List[Dict]]:
     return [entries] if entries else []
 
 
-def _chunk_captions_by_gt(method_chunks_flat: List[Dict], gt_chunks: List[List[Dict]]) -> List[List[Dict]]:
+def _to_sec(v) -> float:
+    """Convert a timestamp value to seconds. Handles MM:SS strings, unix epochs, and floats."""
+    if isinstance(v, str):
+        v = v.strip()
+        if ":" in v:
+            p = v.split(":")
+            try:
+                return int(p[0]) * 60 + int(p[1])
+            except ValueError:
+                return 0.0
+        if not v:
+            return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_screenshot_time_map(screenshots_dir: Path) -> List[float]:
     """
-    Re-group flat method captions to align with GT 8-caption time windows.
-    Each GT chunk covers [gt[0].start_time, gt[-1].end_time].
-    Method captions whose start_time falls in that window are assigned to it.
+    Build a sorted list of unix timestamps from screenshot filenames.
+    Each screenshot filename starts with a unix timestamp, e.g.
+    '1772145150.608936_reason_key_start_stale.png'.
+    The index in this list corresponds to the compressed-video second.
+    """
+    timestamps: List[float] = []
+    for p in sorted(screenshots_dir.iterdir()):
+        if p.suffix == ".png":
+            try:
+                ts_str = p.name.split("_")[0]
+                timestamps.append(float(ts_str))
+            except (ValueError, IndexError):
+                pass
+    return timestamps
+
+
+def _load_ffmpeg_start(session_dir: Path) -> float:
+    """Load the ffmpeg recording start time from recordings_meta.json."""
+    meta_path = session_dir / "ffmpeg" / "recordings_meta.json"
+    if not meta_path.exists():
+        return 0.0
+    with open(meta_path) as f:
+        segments = json.load(f)
+    if segments:
+        return segments[0]["start_time"]
+    return 0.0
+
+
+def _load_scio_data(session_dir: Path) -> List[Dict]:
+    """Load split_compress_io/data.jsonl entries (which carry unix timestamps)."""
+    data_file = session_dir / "split_compress_io" / "data.jsonl"
+    if not data_file.exists():
+        return []
+    entries: List[Dict] = []
+    with open(data_file) as f:
+        for line in f:
+            if line.strip():
+                entries.append(json.loads(line))
+    return entries
+
+
+def _unix_to_screenshot_index(
+    unix_time: float, screenshot_timestamps: List[float],
+) -> int:
+    """Find the screenshot index whose timestamp is closest to *unix_time*."""
+    if not screenshot_timestamps:
+        return 0
+    idx = bisect.bisect_left(screenshot_timestamps, unix_time)
+    if idx == 0:
+        return 0
+    if idx >= len(screenshot_timestamps):
+        return len(screenshot_timestamps) - 1
+    # Return whichever neighbour is closer
+    if unix_time - screenshot_timestamps[idx - 1] <= screenshot_timestamps[idx] - unix_time:
+        return idx - 1
+    return idx
+
+
+def _scio_sec_to_unix(
+    target_sec: float,
+    scio_entries: List[Dict],
+    use_end: bool = False,
+) -> float:
+    """
+    Convert a formatted-time second (shared by GT & SCIO) to unix time
+    using split_compress_io data.jsonl entries as a lookup table.
+
+    use_end=False → match start_formatted, return start_time
+    use_end=True  → match end_formatted,   return end_time
+    """
+    if not scio_entries:
+        return 0.0
+    fmt_key = "end_formatted" if use_end else "start_formatted"
+    unix_key = "end_time" if use_end else "start_time"
+    best_entry = None
+    best_diff = float('inf')
+    for e in scio_entries:
+        e_sec = _to_sec(e.get(fmt_key, ""))
+        diff = abs(e_sec - target_sec)
+        if diff < best_diff:
+            best_diff = diff
+            best_entry = e
+            if diff == 0:
+                break  # Exact match
+    return best_entry.get(unix_key, 0.0) if best_entry else 0.0
+
+
+def _ranges_overlap(
+    a_start: float, a_end: float, b_start: float, b_end: float,
+) -> bool:
+    """Check whether time ranges [a_start, a_end] and [b_start, b_end] overlap."""
+    return not (a_end < b_start or a_start > b_end)
+
+
+def _chunk_captions_by_gt(
+    method_captions: List[Dict],
+    gt_chunks: List[List[Dict]],
+    method: str,
+    scio_data: List[Dict],
+    screenshot_timestamps: List[float],
+    ffmpeg_start: float,
+) -> List[List[Dict]]:
+    """
+    Re-group flat method captions to align with GT chunk time windows.
+
+    Uses split_compress_io/data.jsonl as a *time bridge*:
+    - GT and SCIO share the same formatted-time system (mm:ss → index seconds).
+    - SCIO data.jsonl provides unix timestamps for cross-method mapping.
+
+    Time conversion per method:
+    - naive / split:      video_sec = unix_time − ffmpeg_start
+    - split_compress:     screenshot-index via binary search in timestamp list
+    - split_compress_io:  direct formatted-time matching (same system as GT)
     """
     result: List[List[Dict]] = []
+
     for gt_chunk in gt_chunks:
-        # Get time window from GT
-        starts = [c.get("start_time", c.get("start", 0)) for c in gt_chunk]
-        ends = [c.get("end_time", c.get("end", 0)) for c in gt_chunk]
-        # Convert MM:SS strings if needed
-        def _to_sec(v):
-            if isinstance(v, str) and ":" in v:
-                p = v.split(":")
-                return int(p[0]) * 60 + int(p[1])
-            return float(v) if v else 0.0
-        t_start = min(_to_sec(s) for s in starts)
-        t_end = max(_to_sec(e) for e in ends)
-        window = [
-            c for c in method_chunks_flat
-            if _to_sec(c.get("start_time", c.get("start", 0))) >= t_start
-            and _to_sec(c.get("start_time", c.get("start", 0))) <= t_end
+        # 1. Determine GT chunk time window in formatted seconds
+        valid_starts = [
+            _to_sec(e.get("start_seconds", e.get("start", 0)))
+            for e in gt_chunk if e.get("start")
         ]
+        valid_ends = [
+            _to_sec(e.get("end_seconds", e.get("end", 0)))
+            for e in gt_chunk if e.get("end")
+        ]
+        if not valid_starts or not valid_ends:
+            result.append([])
+            continue
+
+        gt_start_sec = min(valid_starts)
+        gt_end_sec = max(valid_ends)
+
+        # 2. split_compress_io: direct formatted-time matching
+        if method == "split_compress_io":
+            window = [
+                c for c in method_captions
+                if gt_start_sec
+                <= _to_sec(c.get("start_seconds", c.get("start", 0)))
+                <= gt_end_sec
+            ]
+            result.append(window)
+            continue
+
+        # 3. Convert GT formatted seconds → unix time via SCIO bridge
+        unix_start = _scio_sec_to_unix(gt_start_sec, scio_data, use_end=False)
+        unix_end = _scio_sec_to_unix(gt_end_sec, scio_data, use_end=True)
+
+        if unix_start == 0.0 or unix_end == 0.0:
+            # Fallback when no SCIO data is available
+            window = [
+                c for c in method_captions
+                if gt_start_sec
+                <= _to_sec(c.get("start_seconds", c.get("start", 0)))
+                <= gt_end_sec
+            ]
+            result.append(window)
+            continue
+
+        # 4a. naive / split → ffmpeg video seconds
+        if method in ("naive", "split"):
+            vid_start = unix_start - ffmpeg_start
+            vid_end = unix_end - ffmpeg_start
+            window = [
+                c for c in method_captions
+                if _ranges_overlap(
+                    _to_sec(c.get("start_seconds", c.get("start", 0))),
+                    _to_sec(c.get("end_seconds", c.get("end", 0))),
+                    vid_start, vid_end,
+                )
+            ]
+
+        # 4b. split_compress → screenshot indices
+        elif method == "split_compress":
+            idx_start = _unix_to_screenshot_index(unix_start, screenshot_timestamps)
+            idx_end = _unix_to_screenshot_index(unix_end, screenshot_timestamps)
+            window = [
+                c for c in method_captions
+                if _ranges_overlap(
+                    _to_sec(c.get("start_seconds", c.get("start", 0))),
+                    _to_sec(c.get("end_seconds", c.get("end", 0))),
+                    float(idx_start), float(idx_end),
+                )
+            ]
+
+        else:
+            window = []
+
         result.append(window)
+
     return result
 
 
@@ -322,6 +513,7 @@ def run_demo_judge(
     gt_captions_path: Path,
     output_dir: Path,
     num_runs: int = 3,
+    num_workers: int = 4,
     prompt_file: Optional[str] = None,
     n_bootstrap: int = 1000,
 ) -> Dict:
@@ -333,6 +525,7 @@ def run_demo_judge(
         gt_captions_path: path to gt_captions.jsonl
         output_dir: where to save per-run results and summary
         num_runs: number of independent LLM evaluation runs
+        num_workers: number of parallel Gemini evaluation workers
         prompt_file: optional path to external judge prompt
         n_bootstrap: number of bootstrap resamples for SE
 
@@ -347,22 +540,63 @@ def run_demo_judge(
     loader = CaptionLoader()
     gt_chunks = loader.load_ground_truth_jsonl(gt_captions_path)
     num_gt_chunks = len(gt_chunks)
-    print(f"GT: {num_gt_chunks} chunks of 8 captions each")
+    print(f"GT: {num_gt_chunks} chunks of 8 captions each", flush=True)
 
-    # Load method captions and align to GT windows
+    # ── Build screenshot timestamp map ──
+    screenshots_dir: Optional[Path] = None
+    for candidate_dir in [
+        session_dir / "napsack_session" / "screenshots",
+        session_dir / "split_compress" / "screenshots",
+    ]:
+        if candidate_dir.exists():
+            screenshots_dir = candidate_dir
+            break
+
+    screenshot_timestamps: List[float] = []
+    if screenshots_dir:
+        screenshot_timestamps = _build_screenshot_time_map(screenshots_dir)
+        if screenshot_timestamps:
+            napsack_start = screenshot_timestamps[0]
+            print(f"  Screenshots: {len(screenshot_timestamps)} frames, "
+                  f"span = {screenshot_timestamps[-1] - napsack_start:.1f}s", flush=True)
+
+    # ── Load ffmpeg start time ──
+    ffmpeg_start = _load_ffmpeg_start(session_dir)
+    if ffmpeg_start:
+        print(f"  ffmpeg start: {ffmpeg_start}", flush=True)
+
+    # ── Load SCIO data.jsonl (unix timestamps) as time bridge ──
+    scio_data = _load_scio_data(session_dir)
+    if scio_data:
+        print(f"  SCIO data.jsonl: {len(scio_data)} entries (time bridge)", flush=True)
+    else:
+        print(f"  WARNING: split_compress_io/data.jsonl not found — time alignment may be inaccurate", flush=True)
+
+    # ── Load method captions and align to GT chunks ──
     method_data: Dict[str, List[List[Dict]]] = {}
     for m in DEMO_METHODS:
         raw_chunks = _load_method_chunks(session_dir, m)
-        # Flatten all method chunks to re-align by GT timestamps
         flat = [c for chunk in raw_chunks for c in chunk]
-        aligned = _chunk_captions_by_gt(flat, gt_chunks)
+        aligned = _chunk_captions_by_gt(
+            flat, gt_chunks, m, scio_data, screenshot_timestamps, ffmpeg_start,
+        )
         method_data[m] = aligned
-        print(f"  {m}: {sum(len(c) for c in aligned)} captions aligned to {len(aligned)} GT chunks")
+        print(f"  {m}: {sum(len(c) for c in aligned)} captions aligned to {len(aligned)} GT chunks", flush=True)
 
     all_run_scores: Dict[str, List[float]] = defaultdict(list)
 
+    total_pairs = num_runs * num_gt_chunks * len(DEMO_METHODS)
+    done_pairs = 0
+    print(f"[judge] {num_runs} run(s) × {num_gt_chunks} chunk(s) × {len(DEMO_METHODS)} methods = {total_pairs} total pairs (workers={num_workers})", flush=True)
+
+    # Thread-safe counter for progress
+    import threading
+    _progress_lock = threading.Lock()
+
     for run in range(num_runs):
-        print(f"\n=== Run {run + 1}/{num_runs} ===")
+        print(f"\n{'='*60}", flush=True)
+        print(f"=== Run {run + 1}/{num_runs} ===", flush=True)
+        print(f"{'='*60}", flush=True)
         results_file = str(output_dir / f"run_{run}.json")
         evaluator = GeminiEvaluator(
             api_key=api_key,
@@ -370,27 +604,77 @@ def run_demo_judge(
             prompt_file=prompt_file,
             results_file=results_file,
         )
+        run_scores: Dict[str, List[float]] = defaultdict(list)
 
+        # Build list of tasks for this run
+        tasks = []
         for chunk_idx, gt_chunk in enumerate(gt_chunks):
             gt_text = evaluator.format_gt_chunk(gt_chunk)
             for method in DEMO_METHODS:
-                if evaluator.is_pair_evaluated(chunk_idx, method, run):
-                    # Re-collect score from existing results
-                    for ev in evaluator.results["evaluations"]:
-                        if (ev.get("chunk_idx") == chunk_idx and ev.get("method") == method
-                                and ev.get("run") == run and ev.get("evaluation")):
-                            all_run_scores[method].append(ev["evaluation"]["score"])
-                    continue
-                if chunk_idx >= len(method_data.get(method, [])):
-                    print(f"  Skip {method} chunk {chunk_idx} (not available)")
-                    continue
-                candidate = method_data[method][chunk_idx]
-                result = evaluator.evaluate_pair(chunk_idx, method, gt_text, candidate, run)
-                evaluator.add_evaluation(chunk_idx, method, result, run)
-                if result.get("evaluation"):
-                    score = result["evaluation"].get("score", 0.0)
+                tasks.append((chunk_idx, method, gt_text))
+
+        def _eval_task(task_info):
+            """Evaluate a single (chunk, method) pair. Returns (chunk_idx, method, result)."""
+            nonlocal done_pairs
+            chunk_idx, method, gt_text = task_info
+
+            if evaluator.is_pair_evaluated(chunk_idx, method, run):
+                # Re-collect score from existing results (resume)
+                score_found = None
+                for ev in evaluator.results["evaluations"]:
+                    if (ev.get("chunk_idx") == chunk_idx and ev.get("method") == method
+                            and ev.get("run") == run and ev.get("evaluation")):
+                        score_found = ev["evaluation"]["score"]
+                with _progress_lock:
+                    done_pairs += 1
+                    dp = done_pairs
+                print(f"[judge] __progress__ {dp} {total_pairs} Run {run+1}/{num_runs} | chunk {chunk_idx+1}/{num_gt_chunks} | {method} (cached)", flush=True)
+                return (chunk_idx, method, score_found, None)
+
+            if chunk_idx >= len(method_data.get(method, [])):
+                with _progress_lock:
+                    done_pairs += 1
+                    dp = done_pairs
+                print(f"[judge] __progress__ {dp} {total_pairs} Run {run+1}/{num_runs} | chunk {chunk_idx+1}/{num_gt_chunks} | {method} (skipped)", flush=True)
+                return (chunk_idx, method, None, "no captions")
+
+            candidate = method_data[method][chunk_idx]
+            result = evaluator.evaluate_pair(chunk_idx, method, gt_text, candidate, run)
+            evaluator.add_evaluation(chunk_idx, method, result, run)
+
+            with _progress_lock:
+                done_pairs += 1
+                dp = done_pairs
+
+            if result.get("evaluation"):
+                score = result["evaluation"].get("score", 0.0)
+                rationale = result["evaluation"].get("rationale", "")[:100]
+                print(f"  → {method} chunk {chunk_idx+1}: score={score:.3f} | {rationale}", flush=True)
+                print(f"[judge] __progress__ {dp} {total_pairs} Run {run+1}/{num_runs} | chunk {chunk_idx+1}/{num_gt_chunks} | {method}: {score:.3f}", flush=True)
+                return (chunk_idx, method, score, None)
+            else:
+                err = result.get("error", "unknown error")
+                print(f"  → {method} chunk {chunk_idx+1}: ERROR – {err}", flush=True)
+                print(f"[judge] __progress__ {dp} {total_pairs} Run {run+1}/{num_runs} | chunk {chunk_idx+1}/{num_gt_chunks} | {method}: error", flush=True)
+                return (chunk_idx, method, None, err)
+
+        # Execute tasks with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(_eval_task, t): t for t in tasks}
+            for future in as_completed(futures):
+                chunk_idx, method, score, err = future.result()
+                if score is not None:
                     all_run_scores[method].append(score)
-                    print(f"  [run{run}] {method} chunk {chunk_idx}: {score:.3f}")
+                    run_scores[method].append(score)
+
+        # Per-run summary
+        print(f"\n--- Run {run+1}/{num_runs} summary ---", flush=True)
+        for m in DEMO_METHODS:
+            s = run_scores[m]
+            if s:
+                print(f"  {m:30s}: mean={np.mean(s):.3f}  (n={len(s)})", flush=True)
+            else:
+                print(f"  {m:30s}: no scores this run", flush=True)
 
     # Compute summary
     summary: Dict[str, Dict] = {}
@@ -419,6 +703,7 @@ def main():
     parser.add_argument("--session-dir", help="Demo session directory (enables demo mode)")
     parser.add_argument("--output-dir", help="Output directory for judge results (default: <session-dir>/judge)")
     parser.add_argument("--runs", type=int, default=3, help="Number of independent evaluation runs (default: 3)")
+    parser.add_argument("--num-workers", type=int, default=4, help="Number of parallel Gemini judge workers (default: 4)")
     parser.add_argument("--prompt-file", default=None, help="Path to judge prompt template file")
     parser.add_argument("--n-bootstrap", type=int, default=1000, help="Bootstrap resamples for SE (default: 1000)")
     # Legacy args
@@ -444,6 +729,7 @@ def main():
             gt_captions_path=gt_path,
             output_dir=out_dir,
             num_runs=args.runs,
+            num_workers=args.num_workers,
             prompt_file=args.prompt_file,
             n_bootstrap=args.n_bootstrap,
         )

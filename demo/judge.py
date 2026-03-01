@@ -44,7 +44,7 @@ class CaptionLoader:
             all_captions.append(self._load_jsonl(chunk_file))
         return all_captions
 
-    def load_pack_no_key(self) -> List[List[Dict]]:
+    def load_napsack_no_key(self) -> List[List[Dict]]:
         """Load compression without key."""
         chunks = []
         for i in range(6):
@@ -52,7 +52,7 @@ class CaptionLoader:
             chunks.append(self._load_jsonl(chunk_file))
         return chunks
 
-    def load_pack_key(self) -> List[List[Dict]]:
+    def load_napsack_key(self) -> List[List[Dict]]:
         """Load compression with key and chunk into 10-minute segments."""
         all_captions = []
         for i in range(3):
@@ -103,7 +103,7 @@ class GeminiEvaluator:
 
     def __init__(self, api_key: str, results_file: str = "gemini_evaluation_results.json"):
         self.results_file = results_file
-        self.methods = ["flash_10m", "split_1m", "pack_no_key", "pack_key"]
+        self.methods = ["flash_10m", "split_1m", "napsack_no_key", "napsack_key"]
 
         # Configure Gemini API
         genai.configure(api_key=api_key)
@@ -404,8 +404,8 @@ def main():
     data = {
         "flash_10m": loader.load_flash_10m(),
         "split_1m": loader.load_split_1m(),
-        "pack_no_key": loader.load_pack_no_key(),
-        "pack_key": loader.load_pack_key()
+        "napsack_no_key": loader.load_napsack_no_key(),
+        "napsack_key": loader.load_napsack_key()
     }
 
     for method_name, chunks in data.items():

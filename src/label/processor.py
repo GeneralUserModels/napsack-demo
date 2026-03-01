@@ -459,6 +459,7 @@ class Processor:
 
         if results:
             print(f"[Resume] Loaded {len(results)} existing captions, {len(tasks_to_process)} remaining")
+            print(f"CHUNK_PROGRESS: {len(results)}/{len(tasks)}", flush=True)
 
         if not tasks_to_process:
             print("[Resume] All chunks already captioned")
@@ -483,6 +484,7 @@ class Processor:
                         print(f"\n[Error] {task.session_id}/chunk_{task.chunk_index}: {e}")
                         results.append((task, {"error": str(e)}))
                     pbar.update(1)
+                    print(f"CHUNK_PROGRESS: {len(results)}/{len(tasks)}", flush=True)
 
         return results
 

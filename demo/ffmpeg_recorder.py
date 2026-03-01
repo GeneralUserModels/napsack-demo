@@ -9,7 +9,7 @@ monitor.  On stop() the segments are concatenated into a single output
 file (output.mp4).
 
 Writes recordings_meta.json with per-segment start/end Unix timestamps
-in the same format used by the pack recording pipeline.
+in the same format used by the napsack recording pipeline.
 
 Supports:
   Linux   – i3-msg + xrandr  (X11)
