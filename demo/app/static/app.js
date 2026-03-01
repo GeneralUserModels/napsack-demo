@@ -9,7 +9,7 @@ let gtChunkIdx = 0;
 let frameIdx = 0;
 let humanChunks = null;
 let humanChunkIdx = 0;
-let humanExistingRankings = [];
+let humanRankings = {};  // { chunk_idx: { slots: [...] } }
 let activeStep = null;
 
 // ── Lightbox ───────────────────────────────────────────────────────────────
@@ -341,21 +341,15 @@ async function loadGT() {
   const res = await fetch('/api/gt');
   if (!res.ok) { appendLog('[gt] Failed to load: ' + await res.text(), true); return; }
   gtData = await res.json();
+  gtChunkIdx = 0;
   frameIdx = 0;
 
-  const chunkSize = 8;
   if (gtData.existing_gt && gtData.existing_gt.length > 0) {
+    const chunkSize = 8;
     for (let i = 0; i < gtData.chunks.length; i++) {
       const slice = gtData.existing_gt.slice(i * chunkSize, (i + 1) * chunkSize);
       if (slice.length > 0) gtData.chunks[i].captions = slice;
     }
-    // Skip to first unlabeled chunk
-    gtChunkIdx = Math.min(
-      Math.floor(gtData.existing_gt.length / chunkSize),
-      gtData.chunks.length - 1
-    );
-  } else {
-    gtChunkIdx = 0;
   }
 
   document.getElementById('gt-nav').classList.remove('hidden');
@@ -462,20 +456,7 @@ function prevGTChunk() {
 function nextGTChunk() {
   if (!gtData || gtChunkIdx >= gtData.chunks.length - 1) return;
   _syncTextareaToChunk();
-  _autoSaveGTProgress(); // fire-and-forget incremental save
   gtChunkIdx++; frameIdx = 0; renderGTChunk();
-}
-
-/** Incrementally auto-save GT captions up to and including the current chunk. */
-async function _autoSaveGTProgress() {
-  if (!gtData) return;
-  const captions = gtData.chunks.slice(0, gtChunkIdx + 1).flatMap(c => c.captions);
-  try {
-    await fetch('/api/gt/save', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ captions, partial: true })
-    });
-  } catch (_) {}
 }
 
 function _syncTextareaToChunk() {
@@ -533,12 +514,37 @@ async function loadHumanChunks() {
   if (!res.ok) { appendLog('[human] Failed: ' + await res.text(), true); return; }
   const data = await res.json();
   humanChunks = data.chunks;
-  humanExistingRankings = data.existing_rankings || [];
+  humanChunkIdx = 0;
 
-  // Skip to first unranked chunk
-  const rankedIndices = new Set(humanExistingRankings.map(r => r.chunk_idx));
-  const firstUnranked = humanChunks.findIndex((_, i) => !rankedIndices.has(i));
-  humanChunkIdx = firstUnranked >= 0 ? firstUnranked : humanChunks.length - 1;
+  // Load existing rankings
+  humanRankings = {};
+  try {
+    const rankRes = await fetch('/api/human/rankings');
+    if (rankRes.ok) {
+      const rankData = await rankRes.json();
+      (rankData.rankings || []).forEach(r => {
+        humanRankings[r.chunk_idx] = r;
+      });
+    }
+  } catch (_) {}
+
+  // Skip to first unlabeled chunk
+  let firstUnlabeled = humanChunks.length; // default: all done
+  for (let i = 0; i < humanChunks.length; i++) {
+    if (!humanRankings[i]) {
+      firstUnlabeled = i;
+      break;
+    }
+  }
+  humanChunkIdx = firstUnlabeled < humanChunks.length ? firstUnlabeled : 0;
+
+  const labeledCount = Object.keys(humanRankings).length;
+  if (labeledCount > 0) {
+    appendLog(`[human] Loaded ${labeledCount}/${humanChunks.length} existing rankings, ` +
+              (firstUnlabeled < humanChunks.length
+                ? `starting at chunk ${firstUnlabeled + 1}`
+                : 'all chunks ranked — showing chunk 1'));
+  }
 
   document.getElementById('human-eval-ui').classList.remove('hidden');
   renderHumanChunk();
@@ -547,8 +553,14 @@ async function loadHumanChunks() {
 function renderHumanChunk() {
   if (!humanChunks) return;
   const chunk = humanChunks[humanChunkIdx];
+  const totalChunks = humanChunks.length;
+  const labeledCount = Object.keys(humanRankings).length;
+  const isRanked = !!humanRankings[humanChunkIdx];
+
   document.getElementById('human-chunk-indicator').textContent =
-    `Chunk ${humanChunkIdx + 1} / ${humanChunks.length}`;
+    `Chunk ${humanChunkIdx + 1} / ${totalChunks}` +
+    ` (${labeledCount} ranked)` +
+    (isRanked ? ' ✓' : '');
 
   // GT video
   const vidContainer = document.getElementById('human-gt-video-container');
@@ -566,6 +578,15 @@ function renderHumanChunk() {
     `<p>${escHtml(c.caption ?? '')}</p>`
   ).join('');
 
+  // Build a lookup for existing ranks: method -> rank
+  const savedRanks = {};
+  const savedEntry = humanRankings[humanChunkIdx];
+  if (savedEntry) {
+    (savedEntry.slots || []).forEach(s => {
+      savedRanks[s.method] = s.rank;
+    });
+  }
+
   // Candidates
   const panel = document.getElementById('human-candidates-panel');
   panel.innerHTML = '';
@@ -575,6 +596,7 @@ function renderHumanChunk() {
     const capText = cand.captions.map(c =>
       `<p>${escHtml(c.caption ?? '')}</p>`
     ).join('');
+    const existingRank = savedRanks[cand.method_hidden];
     card.innerHTML = `
       <h4>Candidate ${cand.slot}</h4>
       <div class="caption-list" style="max-height:260px">${capText || '<em>No captions</em>'}</div>
@@ -582,25 +604,13 @@ function renderHumanChunk() {
         <label>Rank (1=best):</label>
         <input type="number" min="1" max="4" id="rank-slot-${cand.slot}"
                data-slot="${cand.slot}" data-method="${cand.method_hidden}"
+               value="${existingRank != null ? existingRank : ''}"
                oninput="onRankInput()" />
-        <span class="rank-saved" id="rank-saved-${cand.slot}"></span>
+        <span class="rank-saved" id="rank-saved-${cand.slot}">${existingRank != null ? '✓' : ''}</span>
       </div>
     `;
     panel.appendChild(card);
   });
-
-  // Pre-populate inputs if this chunk was already ranked
-  const existingRanking = humanExistingRankings.find(r => r.chunk_idx === humanChunkIdx);
-  if (existingRanking) {
-    existingRanking.slots.forEach(s => {
-      const inp = document.getElementById(`rank-slot-${s.slot}`);
-      if (inp && s.rank != null) {
-        inp.value = s.rank;
-        const indicator = document.getElementById(`rank-saved-${s.slot}`);
-        if (indicator) indicator.textContent = '✓';
-      }
-    });
-  }
 }
 
 /** Auto-save ranking when all 4 rank inputs are filled */
@@ -619,15 +629,28 @@ async function onRankInput() {
   const filled = slots.filter(s => s.rank !== null);
   if (filled.length < chunk.candidates.length) return; // not all filled yet
 
-  // All filled → auto-save
+  const body = { chunk_idx: humanChunkIdx, slots };
+
+  // All filled → auto-save (upserts on server)
   const res = await fetch('/api/human/rank', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ chunk_idx: humanChunkIdx, slots })
+    body: JSON.stringify(body)
   });
   const data = await res.json();
+
+  // Update local rankings cache
+  humanRankings[humanChunkIdx] = body;
+
+  const labeledCount = Object.keys(humanRankings).length;
   document.getElementById('human-status').textContent =
-    `✓ Auto-saved chunk ${humanChunkIdx + 1} (total: ${data.total})`;
-  appendLog(`[human] Chunk ${humanChunkIdx + 1} ranked (auto-saved)`);
+    `✓ Saved chunk ${humanChunkIdx + 1} (${labeledCount}/${humanChunks.length} ranked)`;
+  appendLog(`[human] Chunk ${humanChunkIdx + 1} ranked (saved)`);
+
+  // Update chunk indicator
+  const isRanked = true;
+  document.getElementById('human-chunk-indicator').textContent =
+    `Chunk ${humanChunkIdx + 1} / ${humanChunks.length}` +
+    ` (${labeledCount} ranked) ✓`;
 
   // Show saved indicator on each input
   chunk.candidates.forEach(cand => {
