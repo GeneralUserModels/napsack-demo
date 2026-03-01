@@ -59,7 +59,8 @@ class ScreenRecorder:
         compression_quality: int = 70,
         lossless: bool = False,
         save_screenshots: bool = True,
-        disable: Optional[List[str]] = None
+        disable: Optional[List[str]] = None,
+        session_dir: Optional[Union[str, Path]] = None,
     ):
         """
         Initialize the screen recorder.
@@ -73,6 +74,8 @@ class ScreenRecorder:
             save_screenshots: If False, skip writing screenshot files to disk
             disable: List of event types to disable recording for.
                      Valid values: "move", "scroll", "click", "key"
+            session_dir: Override the session directory (default: auto-generated
+                         under <repo_root>/logs/session_<timestamp>)
         """
         self.fps = fps
         self.buffer_seconds = buffer_seconds
@@ -85,8 +88,11 @@ class ScreenRecorder:
         self.image_buffer_size = fps * buffer_seconds
         self.event_buffer_size = fps * buffer_seconds * 30
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.session_dir = Path(__file__).parent.parent.parent / "logs" / f"session_{timestamp}"
+        if session_dir is not None:
+            self.session_dir = Path(session_dir)
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.session_dir = Path(__file__).parent.parent.parent / "logs" / f"session_{timestamp}"
         self.session_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Session directory: {self.session_dir}")
@@ -383,6 +389,12 @@ def main():
         help="Event types to disable: move, scroll, click, key. "
              "Example: --disable move scroll"
     )
+    parser.add_argument(
+        "--session-dir",
+        type=str,
+        default=None,
+        help="Override the session directory (default: auto-generated under logs/session_<timestamp>)"
+    )
 
     args = parser.parse_args()
 
@@ -410,7 +422,8 @@ def main():
         accessibility=args.accessibility,
         compression_quality=args.compression_quality,
         lossless=args.lossless,
-        disable=args.disable
+        disable=args.disable,
+        session_dir=args.session_dir,
     )
     recorder.run()
 

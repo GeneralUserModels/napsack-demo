@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NAPsack Demo Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <!-- Loading overlay -->
+  <div id="loading-overlay" class="loading-overlay">
+    <div class="loading-spinner"></div>
+    <p>Connecting to server…</p>
+  </div>
+
+  <!-- Main app wrapper -->
+  <div id="app-wrapper" class="hidden">
+
+  <!-- API Key Warning Banner -->
+  <div id="gemini-warning" class="banner banner-warn hidden">
+    ⚠️ <strong>GEMINI_API_KEY not found.</strong>
+    Create a <code>.env</code> file in the project root with
+    <code>GEMINI_API_KEY=your_key_here</code> and restart the server.
+    Steps 2–4 will not work without it.
+  </div>
+
+  <!-- Header -->
+  <header>
+    <div class="header-inner">
+      <h1>🎬 NAPsack Demo</h1>
+      <p class="subtitle">Compare screen-recording captioning methods end-to-end</p>
+    </div>
+  </header>
+
+  <!-- Main layout: content + sidebar -->
+  <div class="layout">
+
+    <!-- Main content area -->
+    <main class="main-content">
+
+      <!-- Step cards overview row -->
+      <div class="step-cards-row">
+        <button class="step-card" data-step="1" onclick="selectStep(1)">
+          <span class="step-icon">🔴</span>
+          <span class="step-label">Record</span>
+          <span class="step-badge" id="badge-1"></span>
+        </button>
+        <button class="step-card" data-step="2" onclick="selectStep(2)">
+          <span class="step-icon">⚙️</span>
+          <span class="step-label">Captions</span>
+          <span class="step-badge" id="badge-2"></span>
+        </button>
+        <button class="step-card" data-step="3" onclick="selectStep(3)">
+          <span class="step-icon">✏️</span>
+          <span class="step-label">Annotate GT</span>
+          <span class="step-badge" id="badge-3"></span>
+        </button>
+        <button class="step-card" data-step="4" onclick="selectStep(4)">
+          <span class="step-icon">🤖</span>
+          <span class="step-label">LLM Judge</span>
+          <span class="step-badge" id="badge-4"></span>
+        </button>
+        <button class="step-card" data-step="5" onclick="selectStep(5)">
+          <span class="step-icon">👤</span>
+          <span class="step-label">Human Eval</span>
+          <span class="step-badge" id="badge-5"></span>
+        </button>
+      </div>
+
+      <!-- Step canvases (only one visible at a time) -->
+      <div id="canvas-area">
+
+        <!-- Step 1: Record -->
+        <section class="canvas hidden" id="canvas-1">
+          <h2>🔴 Step 1 – Record</h2>
+          <p>Starts both the <strong>napsack</strong> event-driven recorder and the
+             <strong>FFmpeg</strong> continuous video recorder in parallel.</p>
+          <div class="row">
+            <label>Max Resolution:
+              <input id="max-res-w" type="number" value="1920" style="width:70px"/>
+              ×
+              <input id="max-res-h" type="number" value="1080" style="width:70px"/>
+            </label>
+            <button class="btn btn-red" id="record-btn" onclick="toggleRecording()">▶ Start Recording</button>
+          </div>
+          <p id="record-status" class="status-text"></p>
+        </section>
+
+        <!-- Step 2: Process -->
+        <section class="canvas hidden" id="canvas-2">
+          <h2>⚙️ Step 2 – Generate Captions</h2>
+          <p>Run the four captioning methods. Each writes captions to the session directory.</p>
+          <div class="row" style="margin-bottom:10px">
+            <label>Workers: <input id="caption-workers" type="number" value="4" min="1" max="32" style="width:60px" title="Number of parallel VLM labelling workers"/></label>
+          </div>
+          <div class="method-grid">
+            <div class="method-row" id="method-naive">
+              <div class="method-label">
+                <strong>naive</strong>
+                <span class="method-desc">Whole-video Gemini captioning (no split, ffmpeg video)</span>
+              </div>
+              <div class="method-status" id="status-naive">pending</div>
+              <div class="method-size" id="size-naive">–</div>
+              <button class="btn btn-sm" onclick="runMethod('naive')">Run</button>
+              <div class="method-progress-wrap hidden" id="progress-wrap-naive"><div class="method-progress-fill" id="progress-naive"></div></div>
+            </div>
+            <div class="method-row" id="method-split">
+              <div class="method-label">
+                <strong>+ split</strong>
+                <span class="method-desc">Split into 1-min chunks first, then label</span>
+              </div>
+              <div class="method-status" id="status-split">pending</div>
+              <div class="method-size" id="size-split">–</div>
+              <button class="btn btn-sm" onclick="runMethod('split')">Run</button>
+              <div class="method-progress-wrap hidden" id="progress-wrap-split"><div class="method-progress-fill" id="progress-split"></div></div>
+            </div>
+            <div class="method-row" id="method-split_compress">
+              <div class="method-label">
+                <strong>+ split + compress</strong>
+                <span class="method-desc">NAPsack screenshots (event-driven) → 1-min chunks → label</span>
+              </div>
+              <div class="method-status" id="status-split_compress">pending</div>
+              <div class="method-size" id="size-split_compress">–</div>
+              <button class="btn btn-sm" onclick="runMethod('split_compress')">Run</button>
+              <div class="method-progress-wrap hidden" id="progress-wrap-split_compress"><div class="method-progress-fill" id="progress-split_compress"></div></div>
+            </div>
+            <div class="method-row" id="method-split_compress_io">
+              <div class="method-label">
+                <strong>+ split + compress + IO</strong>
+                <span class="method-desc">Full NAPsack (screenshots + events) → fused with video captions</span>
+                <span class="method-dep-note">⚠ Requires <em>+ split + compress</em> to be completed first</span>
+              </div>
+              <div class="method-status" id="status-split_compress_io">pending</div>
+              <div class="method-size" id="size-split_compress_io">–</div>
+              <button class="btn btn-sm" onclick="runMethod('split_compress_io')">Run</button>
+              <div class="method-progress-wrap hidden" id="progress-wrap-split_compress_io"><div class="method-progress-fill" id="progress-split_compress_io"></div></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Step 3: GT Annotation -->
+        <section class="canvas hidden" id="canvas-3">
+          <h2>✏️ Step 3 – Annotate Ground-Truth Captions</h2>
+          <p>Review the <em>split + compress + IO</em> captions and correct them.
+             Left: editable captions (one per line). Right: screenshot matching the selected caption's start time.
+             Click a caption line to see its frame.</p>
+          <button class="btn" onclick="loadGT()">Load Captions for Annotation</button>
+
+          <div id="gt-nav" class="hidden">
+            <div class="gt-chunk-nav">
+              <button class="btn btn-sm" onclick="prevGTChunk()">← Prev Chunk</button>
+              <span id="gt-chunk-indicator">Chunk 1 / ?</span>
+              <button class="btn btn-sm" onclick="nextGTChunk()">Next Chunk →</button>
+            </div>
+
+            <div class="gt-split-pane">
+              <div class="gt-left">
+                <h4>Captions <span class="gt-hint">(one per line – click a line to preview its frame)</span></h4>
+                <textarea id="gt-textarea" rows="12" spellcheck="false"></textarea>
+              </div>
+              <div class="gt-right">
+                <h4>Screenshot <span id="gt-frame-label" class="gt-hint"></span></h4>
+                <div class="gt-frame-container">
+                  <img id="gt-frame-img" src="" alt="frame" />
+                </div>
+                <div class="gt-frame-nav">
+                  <button class="btn btn-sm" onclick="prevGTFrame()">◀ Prev</button>
+                  <span id="gt-frame-indicator">–</span>
+                  <button class="btn btn-sm" onclick="nextGTFrame()">Next ▶</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="row" style="margin-top:12px">
+              <button class="btn btn-green" onclick="saveGT()">💾 Save GT Captions</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- Step 4: LLM Judge -->
+        <section class="canvas hidden" id="canvas-4">
+          <h2>🤖 Step 4 – LLM Judge</h2>
+          <p>Run the LLM judge comparing all four methods against GT captions (3 independent runs, bootstrap SE).</p>
+          <div class="row">
+            <label>Runs: <input id="judge-runs" type="number" value="3" min="1" max="10" style="width:60px"/></label>
+            <label>Workers: <input id="judge-workers" type="number" value="4" min="1" max="32" style="width:60px" title="Number of parallel Gemini judge workers"/></label>
+            <button class="btn" onclick="runJudge()">▶ Run Judge</button>
+          </div>          <div id="judge-progress-wrap" class="hidden" style="margin-top:10px">
+            <div class="judge-progress-outer">
+              <div class="judge-progress-fill" id="judge-progress-fill"></div>
+            </div>
+            <p class="judge-progress-label" id="judge-progress-label"></p>
+          </div>          <p id="judge-status" class="status-text"></p>
+        </section>
+
+        <!-- Step 5: Human Evaluation -->
+        <section class="canvas hidden" id="canvas-5">
+          <h2>👤 Step 5 – Human Evaluation</h2>
+          <p>Rank the four method outputs (blinded) for each GT chunk. Rankings auto-save when all 4 ranks are filled.</p>
+          <button class="btn" onclick="loadHumanChunks()">Load Chunks for Ranking</button>
+
+          <div id="human-eval-ui" class="hidden">
+            <div class="gt-chunk-nav">
+              <button class="btn btn-sm" onclick="prevHumanChunk()">← Prev</button>
+              <span id="human-chunk-indicator">Chunk 1 / ?</span>
+              <button class="btn btn-sm" onclick="nextHumanChunk()">Next →</button>
+            </div>
+
+            <div id="human-gt-video-container" class="hidden" style="margin-bottom:12px">
+              <p><strong>GT video clip:</strong></p>
+              <video id="human-gt-video" controls style="max-width:400px;border-radius:6px;"></video>
+            </div>
+
+            <div class="human-split">
+              <div class="human-gt">
+                <h4>Ground Truth</h4>
+                <div id="human-gt-captions" class="caption-list"></div>
+              </div>
+              <div class="human-candidates" id="human-candidates-panel"></div>
+            </div>
+
+            <p id="human-status" class="status-text"></p>
+          </div>
+
+          <div style="margin-top:16px">
+            <button class="btn" onclick="finalizeHuman()">📊 Compute Correlations</button>
+          </div>
+        </section>
+
+      </div><!-- /canvas-area -->
+
+      <!-- Results -->
+      <section class="card" id="results-card">
+        <div class="card-header">
+          <h2>📊 Results</h2>
+          <button class="btn btn-sm" onclick="loadResults()">Refresh</button>
+        </div>
+
+        <div id="results-table-container" class="hidden" style="margin-top:16px">
+          <table id="results-table">
+            <thead>
+              <tr>
+                <th>Method</th>
+                <th>Judge Score (↑)</th>
+                <th>Avg Rank (↓)</th>
+                <th>Size (↓)</th>
+              </tr>
+            </thead>
+            <tbody id="results-tbody"></tbody>
+          </table>
+        </div>
+
+        <div id="correlation-container" class="hidden" style="margin-top:16px">
+          <h3>Human vs LLM Correlation</h3>
+          <table id="corr-table">
+            <thead><tr><th>Metric</th><th>Value</th><th><em>p</em>-value</th></tr></thead>
+            <tbody id="corr-tbody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Log Console -->
+      <section class="card" id="log-card">
+        <div class="card-header">
+          <h2>📋 Live Log</h2>
+          <button class="btn btn-sm" onclick="clearLog()">Clear</button>
+        </div>
+        <div id="log-console" class="log-console"></div>
+      </section>
+
+    </main>
+
+    <!-- Right sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-section">
+        <h3>📂 Session</h3>
+        <select id="session-dropdown">
+          <option value="">— Select session —</option>
+        </select>
+        <div class="session-input-row">
+          <input id="session-dir-input" type="text" placeholder="/path/to/session" />
+          <button class="btn btn-sm" onclick="loadSession()">Load</button>
+        </div>
+        <p id="session-status" class="status-text"></p>
+      </div>
+    </aside>
+
+  </div><!-- /layout -->
+
+  </div><!-- /app-wrapper -->
+
+  <!-- Lightbox overlay for full-size screenshots -->
+  <div id="lightbox-overlay" class="lightbox-overlay hidden" onclick="closeLightbox()">
+    <img id="lightbox-img" src="" alt="full-size" />
+    <button class="lightbox-close" onclick="closeLightbox()">&times;</button>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

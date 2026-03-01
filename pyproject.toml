@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pack"
+name = "napsack"
 version = "0.1.0"
-description = "Pack records and aggregates your computer use — screenshots plus input events (click, keypress, scroll, cursor move). It groups activity into event bursts and uses a VLM pipeline to generate human-readable captions describing what happened."
+description = "NAPsack records and aggregates your computer use — screenshots plus input events (click, keypress, scroll, cursor move). It groups activity into event bursts and uses a VLM pipeline to generate human-readable captions describing what happened."
 requires-python = ">=3.11,<=3.13"
 dependencies = [
     "mss (>=10.0.0,<11.0.0)",
@@ -30,14 +30,24 @@ dependencies = [
     "openai>=2.8.1",
     "google-cloud-storage>=3.6.0",
     "google-cloud-bigquery>=3.38.0",
+    # Demo dashboard
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "python-dotenv>=1.0.0",
+    "sse-starlette>=2.1.0",
+    "scipy>=1.13.0",
 ]
+
+[project.scripts]
+demo = "demo.__main__:main"
 
 [tool.uv]
 package = true
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["label*", "record*"]
+
+[tool.setuptools.package-data]
+"label" = ["prompts/*.txt"]
+"demo.app" = ["static/*"]
