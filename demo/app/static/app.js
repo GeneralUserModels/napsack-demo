@@ -537,7 +537,7 @@ function renderHumanChunk() {
   // GT captions
   const gtEl = document.getElementById('human-gt-captions');
   gtEl.innerHTML = chunk.gt_captions.map(c =>
-    `<p><strong>[${escHtml(String(c.start ?? c.start_time ?? ''))} → ${escHtml(String(c.end ?? c.end_time ?? ''))}]</strong> ${escHtml(c.caption ?? '')}</p>`
+    `<p>${escHtml(c.caption ?? '')}</p>`
   ).join('');
 
   // Candidates
@@ -547,7 +547,7 @@ function renderHumanChunk() {
     const card = document.createElement('div');
     card.className = 'candidate-card';
     const capText = cand.captions.map(c =>
-      `<p>[${escHtml(String(c.start ?? c.start_time ?? ''))} → ${escHtml(String(c.end ?? c.end_time ?? ''))}] ${escHtml(c.caption ?? '')}</p>`
+      `<p>${escHtml(c.caption ?? '')}</p>`
     ).join('');
     card.innerHTML = `
       <h4>Candidate ${cand.slot}</h4>
