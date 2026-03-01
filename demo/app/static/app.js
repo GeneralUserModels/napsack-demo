@@ -9,6 +9,7 @@ let gtChunkIdx = 0;
 let frameIdx = 0;
 let humanChunks = null;
 let humanChunkIdx = 0;
+let humanExistingRankings = [];
 let activeStep = null;
 
 // ── Lightbox ───────────────────────────────────────────────────────────────
@@ -340,15 +341,21 @@ async function loadGT() {
   const res = await fetch('/api/gt');
   if (!res.ok) { appendLog('[gt] Failed to load: ' + await res.text(), true); return; }
   gtData = await res.json();
-  gtChunkIdx = 0;
   frameIdx = 0;
 
+  const chunkSize = 8;
   if (gtData.existing_gt && gtData.existing_gt.length > 0) {
-    const chunkSize = 8;
     for (let i = 0; i < gtData.chunks.length; i++) {
       const slice = gtData.existing_gt.slice(i * chunkSize, (i + 1) * chunkSize);
       if (slice.length > 0) gtData.chunks[i].captions = slice;
     }
+    // Skip to first unlabeled chunk
+    gtChunkIdx = Math.min(
+      Math.floor(gtData.existing_gt.length / chunkSize),
+      gtData.chunks.length - 1
+    );
+  } else {
+    gtChunkIdx = 0;
   }
 
   document.getElementById('gt-nav').classList.remove('hidden');
@@ -455,7 +462,20 @@ function prevGTChunk() {
 function nextGTChunk() {
   if (!gtData || gtChunkIdx >= gtData.chunks.length - 1) return;
   _syncTextareaToChunk();
+  _autoSaveGTProgress(); // fire-and-forget incremental save
   gtChunkIdx++; frameIdx = 0; renderGTChunk();
+}
+
+/** Incrementally auto-save GT captions up to and including the current chunk. */
+async function _autoSaveGTProgress() {
+  if (!gtData) return;
+  const captions = gtData.chunks.slice(0, gtChunkIdx + 1).flatMap(c => c.captions);
+  try {
+    await fetch('/api/gt/save', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ captions, partial: true })
+    });
+  } catch (_) {}
 }
 
 function _syncTextareaToChunk() {
@@ -513,7 +533,13 @@ async function loadHumanChunks() {
   if (!res.ok) { appendLog('[human] Failed: ' + await res.text(), true); return; }
   const data = await res.json();
   humanChunks = data.chunks;
-  humanChunkIdx = 0;
+  humanExistingRankings = data.existing_rankings || [];
+
+  // Skip to first unranked chunk
+  const rankedIndices = new Set(humanExistingRankings.map(r => r.chunk_idx));
+  const firstUnranked = humanChunks.findIndex((_, i) => !rankedIndices.has(i));
+  humanChunkIdx = firstUnranked >= 0 ? firstUnranked : humanChunks.length - 1;
+
   document.getElementById('human-eval-ui').classList.remove('hidden');
   renderHumanChunk();
 }
@@ -562,6 +588,19 @@ function renderHumanChunk() {
     `;
     panel.appendChild(card);
   });
+
+  // Pre-populate inputs if this chunk was already ranked
+  const existingRanking = humanExistingRankings.find(r => r.chunk_idx === humanChunkIdx);
+  if (existingRanking) {
+    existingRanking.slots.forEach(s => {
+      const inp = document.getElementById(`rank-slot-${s.slot}`);
+      if (inp && s.rank != null) {
+        inp.value = s.rank;
+        const indicator = document.getElementById(`rank-saved-${s.slot}`);
+        if (indicator) indicator.textContent = '✓';
+      }
+    });
+  }
 }
 
 /** Auto-save ranking when all 4 rank inputs are filled */

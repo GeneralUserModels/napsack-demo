@@ -453,16 +453,18 @@ async def save_gt(body: dict):
     gt_path = gt_dir / "gt_captions.jsonl"
 
     captions = body.get("captions", [])
+    partial = body.get("partial", False)
     with open(gt_path, "w") as f:
         for cap in captions:
             f.write(json.dumps(cap) + "\n")
 
-    _state.gt.done = True
+    if not partial:
+        _state.gt.done = True
     _state.gt.gt_captions_path = str(gt_path)
     _state.gt.num_chunks = (len(captions) + 7) // 8
     _state.save()
 
-    _log(f"[gt] Saved {len(captions)} GT captions to {gt_path}")
+    _log(f"[gt] {'Auto-saved' if partial else 'Saved'} {len(captions)} GT captions to {gt_path}")
     return JSONResponse({"status": "saved", "num_captions": len(captions), "path": str(gt_path)})
 
 
@@ -608,7 +610,14 @@ async def get_human_chunks():
             "gt_video": gt_video,
         })
 
-    return JSONResponse({"chunks": result_chunks})
+    # Load existing rankings so the frontend can restore & skip annotated chunks
+    hr_path = session_dir / "human_eval" / "rankings.json"
+    existing_rankings: List[Dict] = []
+    if hr_path.exists():
+        with open(hr_path) as f:
+            existing_rankings = json.load(f)
+
+    return JSONResponse({"chunks": result_chunks, "existing_rankings": existing_rankings})
 
 
 @app.post("/api/human/rank")
@@ -627,7 +636,14 @@ async def save_human_rank(body: dict):
         with open(rankings_path) as f:
             rankings = json.load(f)
 
-    rankings.append(body)
+    chunk_idx = body.get("chunk_idx")
+    existing_idx = next(
+        (i for i, r in enumerate(rankings) if r.get("chunk_idx") == chunk_idx), None
+    )
+    if existing_idx is not None:
+        rankings[existing_idx] = body
+    else:
+        rankings.append(body)
     with open(rankings_path, "w") as f:
         json.dump(rankings, f, indent=2)
 
