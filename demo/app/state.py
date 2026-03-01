@@ -114,6 +114,7 @@ class DemoState:
 def _to_dict(state: Any) -> Dict[str, Any]:
     """Recursively convert dataclass to plain dict (skips _lock)."""
     import dataclasses
+    import math
 
     def _conv(obj: Any) -> Any:
         if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
@@ -126,6 +127,9 @@ def _to_dict(state: Any) -> Dict[str, Any]:
             return {k: _conv(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [_conv(v) for v in obj]
+        # NaN / Inf are not valid JSON — convert to None so JSONResponse never crashes
+        if isinstance(obj, float) and not math.isfinite(obj):
+            return None
         return obj
 
     return _conv(state)

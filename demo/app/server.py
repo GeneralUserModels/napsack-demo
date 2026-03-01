@@ -665,7 +665,18 @@ async def save_human_rank(body: dict):
 
 @app.post("/api/human/finalize")
 async def finalize_human_eval():
-    """Compute Pearson r and Spearman ρ between human ranks and LLM scores."""
+    """Compute Pearson r and Spearman ρ between human ranks and LLM scores.
+
+    Uses per-chunk within-chunk correlation, averaged across all chunks.
+    For each chunk that has all 4 methods rated by both human and LLM judge,
+    we compute the Spearman/Pearson correlation between the 4 human ranks
+    and the 4 (negated) LLM scores, then report the mean across chunks.
+
+    Human ranks: 1=best, 4=worst (lower is better).
+    LLM scores:  0=worst, 1=best (higher is better).
+    We negate LLM scores so both axes point the same direction; a positive
+    correlation means the human and LLM judge agree.
+    """
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
     if _state.judge.status != "done":
@@ -680,44 +691,95 @@ async def finalize_human_eval():
     with open(rankings_path) as f:
         rankings: List[Dict] = json.load(f)
 
-    # Build per-method human rank and LLM score vectors
-    judge_summary = _state.judge.summary or {}
-    judge_methods = judge_summary.get("methods", {})
+    # ── Load per-chunk LLM scores from judge run files ──────────────────────
+    import glob
+    judge_dir = session_dir / "judge"
+    run_files = sorted(glob.glob(str(judge_dir / "run_*.json")))
+    if not run_files:
+        raise HTTPException(status_code=400, detail="No judge run files found")
 
-    # Aggregate mean human rank per method across all chunks
-    human_ranks: Dict[str, List[float]] = {m: [] for m in METHODS}
+    # Average LLM score per (chunk_idx, method) across all runs
+    from collections import defaultdict
+    score_accum: Dict[tuple, List[float]] = defaultdict(list)
+    for rf in run_files:
+        with open(rf) as f:
+            run_data = json.load(f)
+        for ev in run_data.get("evaluations", []):
+            evaluation = ev.get("evaluation")
+            if evaluation and isinstance(evaluation, dict) and "score" in evaluation:
+                key = (ev["chunk_idx"], ev["method"])
+                score_accum[key].append(float(evaluation["score"]))
+
+    score_lookup: Dict[tuple, float] = {
+        k: sum(v) / len(v) for k, v in score_accum.items()
+    }
+
+    # ── Build per-chunk human rank lookup ───────────────────────────────────
+    rank_lookup: Dict[tuple, float] = {}
     for entry in rankings:
+        ci = entry["chunk_idx"]
         for slot in entry.get("slots", []):
             m = slot.get("method")
             r = slot.get("rank")
             if m and r is not None:
-                human_ranks[m].append(float(r))
+                rank_lookup[(ci, m)] = float(r)
 
-    mean_human: Dict[str, float] = {
-        m: float(sum(v) / len(v)) if v else 0.0
-        for m, v in human_ranks.items()
-    }
+    # ── Per-chunk within-chunk correlation ──────────────────────────────────
+    from scipy.stats import pearsonr, spearmanr, ttest_1samp  # type: ignore
+    import numpy as np
+
+    chunk_indices = sorted({ci for ci, _ in rank_lookup})
+    per_chunk_pearson: List[float] = []
+    per_chunk_spearman: List[float] = []
+
+    for ci in chunk_indices:
+        h_vec: List[float] = []
+        l_vec: List[float] = []
+        for m in METHODS:
+            rk = rank_lookup.get((ci, m))
+            sc = score_lookup.get((ci, m))
+            if rk is not None and sc is not None:
+                h_vec.append(rk)
+                # Negate so higher = worse, matching rank direction
+                l_vec.append(-sc)
+        # Need all 4 methods and non-constant vectors
+        if len(h_vec) < len(METHODS):
+            continue
+        if len(set(h_vec)) < 2 or len(set(l_vec)) < 2:
+            continue
+        r_c, _ = pearsonr(h_vec, l_vec)
+        rho_c, _ = spearmanr(h_vec, l_vec)
+        per_chunk_pearson.append(float(r_c))
+        per_chunk_spearman.append(float(rho_c))
+
+    n_chunks = len(per_chunk_pearson)
+    if n_chunks < 2:
+        raise HTTPException(status_code=400, detail="Not enough valid chunks for correlation")
+
+    mean_pear = float(np.mean(per_chunk_pearson))
+    mean_spear = float(np.mean(per_chunk_spearman))
+    _, pval_pear = ttest_1samp(per_chunk_pearson, 0)
+    _, pval_spear = ttest_1samp(per_chunk_spearman, 0)
+
+    # ── Per-method summary stats (for display in results table) ─────────────
+    judge_summary = _state.judge.summary or {}
+    judge_methods = judge_summary.get("methods", {})
+
+    mean_human: Dict[str, float] = {}
+    for m in METHODS:
+        vals = [rank_lookup[(ci, m)] for ci in chunk_indices if (ci, m) in rank_lookup]
+        mean_human[m] = float(sum(vals) / len(vals)) if vals else 0.0
+
     mean_llm: Dict[str, float] = {
         m: judge_methods.get(m, {}).get("mean", 0.0) for m in METHODS
     }
 
-    # Vectors for correlation (same order).
-    # Human ranks: 1=best, 4=worst  (lower is better)
-    # LLM scores:  0=worst, 1=best  (higher is better)
-    # Negate LLM scores so both axes point in the same direction
-    # (higher negated score → worse method, matching higher human rank → worse method).
-    h_vec = [mean_human[m] for m in METHODS]
-    l_vec = [-mean_llm[m] for m in METHODS]
-
-    from scipy.stats import pearsonr, spearmanr  # type: ignore
-    pear_r, pear_p = pearsonr(h_vec, l_vec)
-    spear_r, spear_p = spearmanr(h_vec, l_vec)
-
     correlations = {
-        "pearson_r": float(pear_r),
-        "pearson_p": float(pear_p),
-        "spearman_rho": float(spear_r),
-        "spearman_p": float(spear_p),
+        "pearson_r": mean_pear,
+        "pearson_p": float(pval_pear),
+        "spearman_rho": mean_spear,
+        "spearman_p": float(pval_spear),
+        "n_chunks": n_chunks,
         "mean_human_rank": mean_human,
         "mean_llm_score": mean_llm,
     }
@@ -731,7 +793,9 @@ async def finalize_human_eval():
     _state.human_eval.status = "done"
     _state.save()
 
-    _log(f"[human_eval] Pearson r={pear_r:.3f}  Spearman ρ={spear_r:.3f}")
+    _log(f"[human_eval] Per-chunk correlation (n={n_chunks}): "
+         f"Pearson r={mean_pear:.3f} (p={pval_pear:.4f})  "
+         f"Spearman ρ={mean_spear:.3f} (p={pval_spear:.4f})")
     return JSONResponse(correlations)
 
 

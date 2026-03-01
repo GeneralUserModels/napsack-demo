@@ -704,10 +704,11 @@ async function loadResults() {
   // Correlation table
   if (data.human_eval) {
     const he = data.human_eval;
+    const nChunks = he.n_chunks != null ? ` (n=${he.n_chunks} chunks)` : '';
     const cTbody = document.getElementById('corr-tbody');
     cTbody.innerHTML = `
-      <tr><td>Pearson <em>r</em></td><td>${he.pearson_r?.toFixed(3) ?? '–'}</td><td>${he.pearson_p?.toFixed(4) ?? '–'}</td></tr>
-      <tr><td>Spearman <em>ρ</em></td><td>${he.spearman_rho?.toFixed(3) ?? '–'}</td><td>${he.spearman_p?.toFixed(4) ?? '–'}</td></tr>
+      <tr><td>Pearson <em>r</em>${nChunks}</td><td>${he.pearson_r?.toFixed(3) ?? '–'}</td><td>${he.pearson_p?.toFixed(4) ?? '–'}</td></tr>
+      <tr><td>Spearman <em>ρ</em>${nChunks}</td><td>${he.spearman_rho?.toFixed(3) ?? '–'}</td><td>${he.spearman_p?.toFixed(4) ?? '–'}</td></tr>
     `;
     document.getElementById('correlation-container').classList.remove('hidden');
   }
