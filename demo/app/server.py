@@ -701,9 +701,13 @@ async def finalize_human_eval():
         m: judge_methods.get(m, {}).get("mean", 0.0) for m in METHODS
     }
 
-    # Vectors for correlation (same order)
+    # Vectors for correlation (same order).
+    # Human ranks: 1=best, 4=worst  (lower is better)
+    # LLM scores:  0=worst, 1=best  (higher is better)
+    # Negate LLM scores so both axes point in the same direction
+    # (higher negated score → worse method, matching higher human rank → worse method).
     h_vec = [mean_human[m] for m in METHODS]
-    l_vec = [mean_llm[m] for m in METHODS]
+    l_vec = [-mean_llm[m] for m in METHODS]
 
     from scipy.stats import pearsonr, spearmanr  # type: ignore
     pear_r, pear_p = pearsonr(h_vec, l_vec)
