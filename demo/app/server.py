@@ -549,9 +549,8 @@ async def get_human_chunks_pairwise(request: Request, n: int = 10):
     from itertools import combinations
 
     session_dir = Path(_state.session_dir)
-    # Deterministic seed so reloading with the same session + n gives identical order
-    _seed = hash(str(session_dir.resolve()) + str(n)) & 0x7FFFFFFF
-    rng = _random.Random(_seed)
+    # Fixed seed — guarantees identical trial order on every machine / reload
+    rng = _random.Random(42)
     gt_path = Path(_state.gt.gt_captions_path)
 
     # ── Load GT chunks ──────────────────────────────────────────────────────
