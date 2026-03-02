@@ -52,9 +52,9 @@ class JudgeState:
 @dataclass
 class HumanEvalState:
     status: str = "pending"   # pending | running | done
-    rankings_path: Optional[str] = None       # <session>/human_eval/rankings.json
-    correlations_path: Optional[str] = None   # <session>/human_eval/correlations.json
-    correlations: Optional[Dict[str, Any]] = None
+    rankings_path: Optional[str] = None       # <session>/human_eval/pairwise.json
+    results_path: Optional[str] = None        # <session>/human_eval/win_rates.json
+    results: Optional[Dict[str, Any]] = None  # win rates per method
 
 
 @dataclass

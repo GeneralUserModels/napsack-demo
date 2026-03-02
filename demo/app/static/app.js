@@ -7,9 +7,9 @@ let serverState = {};
 let gtData = null;
 let gtChunkIdx = 0;
 let frameIdx = 0;
-let humanChunks = null;
-let humanChunkIdx = 0;
-let humanRankings = {};  // { chunk_idx: { slots: [...] } }
+let pairwiseTrials = null;  // array of trial objects from server
+let trialIdx = 0;           // current position in the trials list
+let pairwiseJudgments = {}; // keyed by "pair_id::chunk_idx"
 let activeStep = null;
 
 // ── Lightbox ───────────────────────────────────────────────────────────────
@@ -508,171 +508,187 @@ async function runJudge() {
   await pollStatus();
 }
 
-// ── Step 5: Human Evaluation ───────────────────────────────────────────────
-async function loadHumanChunks() {
-  const res = await fetch('/api/human/chunks');
+// ── Step 5: Pairwise Human Evaluation ──────────────────────────────────────
+async function loadPairwiseTrials() {
+  const nSamples = parseInt(document.getElementById('human-n-samples').value) || 10;
+  const res = await fetch(`/api/human/chunks?n=${nSamples}`);
   if (!res.ok) { appendLog('[human] Failed: ' + await res.text(), true); return; }
   const data = await res.json();
-  humanChunks = data.chunks;
-  humanChunkIdx = 0;
+  pairwiseTrials = data.trials;
+  trialIdx = 0;
 
-  // Load existing rankings
-  humanRankings = {};
+  // Load existing judgments
+  pairwiseJudgments = {};
   try {
-    const rankRes = await fetch('/api/human/rankings');
-    if (rankRes.ok) {
-      const rankData = await rankRes.json();
-      (rankData.rankings || []).forEach(r => {
-        humanRankings[r.chunk_idx] = r;
+    const jr = await fetch('/api/human/rankings');
+    if (jr.ok) {
+      const jd = await jr.json();
+      (jd.judgments || []).forEach(j => {
+        const key = `${j.pair_id}::${j.chunk_idx}`;
+        pairwiseJudgments[key] = j;
       });
     }
   } catch (_) {}
 
-  // Skip to first unlabeled chunk
-  let firstUnlabeled = humanChunks.length; // default: all done
-  for (let i = 0; i < humanChunks.length; i++) {
-    if (!humanRankings[i]) {
-      firstUnlabeled = i;
-      break;
-    }
+  // Skip to first unjudged trial
+  let firstOpen = pairwiseTrials.length;
+  for (let i = 0; i < pairwiseTrials.length; i++) {
+    const t = pairwiseTrials[i];
+    const key = `${t.pair_id}::${t.chunk_idx}`;
+    if (!pairwiseJudgments[key]) { firstOpen = i; break; }
   }
-  humanChunkIdx = firstUnlabeled < humanChunks.length ? firstUnlabeled : 0;
+  trialIdx = firstOpen < pairwiseTrials.length ? firstOpen : 0;
 
-  const labeledCount = Object.keys(humanRankings).length;
-  if (labeledCount > 0) {
-    appendLog(`[human] Loaded ${labeledCount}/${humanChunks.length} existing rankings, ` +
-              (firstUnlabeled < humanChunks.length
-                ? `starting at chunk ${firstUnlabeled + 1}`
-                : 'all chunks ranked — showing chunk 1'));
+  const doneCount = Object.keys(pairwiseJudgments).length;
+  if (doneCount > 0) {
+    appendLog(`[human] Loaded ${doneCount}/${pairwiseTrials.length} existing judgments, ` +
+              (firstOpen < pairwiseTrials.length
+                ? `starting at trial ${firstOpen + 1}`
+                : 'all done — showing trial 1'));
   }
 
   document.getElementById('human-eval-ui').classList.remove('hidden');
-  renderHumanChunk();
+  renderTrial();
 }
 
-function renderHumanChunk() {
-  if (!humanChunks) return;
-  const chunk = humanChunks[humanChunkIdx];
-  const totalChunks = humanChunks.length;
-  const labeledCount = Object.keys(humanRankings).length;
-  const isRanked = !!humanRankings[humanChunkIdx];
+function renderTrial() {
+  if (!pairwiseTrials) return;
+  const trial = pairwiseTrials[trialIdx];
+  const total = pairwiseTrials.length;
+  const doneCount = Object.keys(pairwiseJudgments).length;
+  const key = `${trial.pair_id}::${trial.chunk_idx}`;
+  const judged = !!pairwiseJudgments[key];
 
   document.getElementById('human-chunk-indicator').textContent =
-    `Chunk ${humanChunkIdx + 1} / ${totalChunks}` +
-    ` (${labeledCount} ranked)` +
-    (isRanked ? ' ✓' : '');
+    `Trial ${trialIdx + 1} / ${total} (${doneCount} done)` + (judged ? ' ✓' : '');
 
   // GT video
   const vidContainer = document.getElementById('human-gt-video-container');
   const vidEl = document.getElementById('human-gt-video');
-  if (chunk.gt_video) {
+  if (trial.gt_video) {
     vidContainer.classList.remove('hidden');
-    vidEl.src = `/api/media/${encodeURIComponent(chunk.gt_video)}`;
+    vidEl.src = `/api/media/${encodeURIComponent(trial.gt_video)}`;
   } else {
     vidContainer.classList.add('hidden');
   }
 
   // GT captions
-  const gtEl = document.getElementById('human-gt-captions');
-  gtEl.innerHTML = chunk.gt_captions.map(c =>
-    `<p>${escHtml(c.caption ?? '')}</p>`
-  ).join('');
+  document.getElementById('human-gt-captions').innerHTML =
+    trial.gt_captions.map(c => `<p>${escHtml(c.caption ?? '')}</p>`).join('');
 
-  // Build a lookup for existing ranks: method -> rank
-  const savedRanks = {};
-  const savedEntry = humanRankings[humanChunkIdx];
-  if (savedEntry) {
-    (savedEntry.slots || []).forEach(s => {
-      savedRanks[s.method] = s.rank;
-    });
+  // Left candidate
+  document.getElementById('pw-left-captions').innerHTML =
+    trial.left.captions.map(c => `<p>${escHtml(c.caption ?? '')}</p>`).join('') || '<em>No captions</em>';
+
+  // Right candidate
+  document.getElementById('pw-right-captions').innerHTML =
+    trial.right.captions.map(c => `<p>${escHtml(c.caption ?? '')}</p>`).join('') || '<em>No captions</em>';
+
+  // Highlight previous choice if any
+  const leftCard = document.getElementById('pairwise-left');
+  const rightCard = document.getElementById('pairwise-right');
+  leftCard.classList.remove('pw-selected', 'pw-draw');
+  rightCard.classList.remove('pw-selected', 'pw-draw');
+  if (judged) {
+    const prev = pairwiseJudgments[key];
+    if (prev.draw) {
+      leftCard.classList.add('pw-draw');
+      rightCard.classList.add('pw-draw');
+    } else if (prev.winner_method === trial.left.method_hidden) {
+      leftCard.classList.add('pw-selected');
+    } else {
+      rightCard.classList.add('pw-selected');
+    }
   }
-
-  // Candidates
-  const panel = document.getElementById('human-candidates-panel');
-  panel.innerHTML = '';
-  chunk.candidates.forEach(cand => {
-    const card = document.createElement('div');
-    card.className = 'candidate-card';
-    const capText = cand.captions.map(c =>
-      `<p>${escHtml(c.caption ?? '')}</p>`
-    ).join('');
-    const existingRank = savedRanks[cand.method_hidden];
-    card.innerHTML = `
-      <h4>Candidate ${cand.slot}</h4>
-      <div class="caption-list" style="max-height:260px">${capText || '<em>No captions</em>'}</div>
-      <div class="rank-input">
-        <label>Rank (1=best):</label>
-        <input type="number" min="1" max="4" id="rank-slot-${cand.slot}"
-               data-slot="${cand.slot}" data-method="${cand.method_hidden}"
-               value="${existingRank != null ? existingRank : ''}"
-               oninput="onRankInput()" />
-        <span class="rank-saved" id="rank-saved-${cand.slot}">${existingRank != null ? '✓' : ''}</span>
-      </div>
-    `;
-    panel.appendChild(card);
-  });
 }
 
-/** Auto-save ranking when all 4 rank inputs are filled */
-async function onRankInput() {
-  if (!humanChunks) return;
-  const chunk = humanChunks[humanChunkIdx];
-  const slots = chunk.candidates.map(cand => {
-    const inp = document.getElementById(`rank-slot-${cand.slot}`);
-    return {
-      slot: cand.slot,
-      method: cand.method_hidden,
-      rank: inp ? parseInt(inp.value) || null : null,
-    };
-  });
+async function pickWinner(side) {
+  if (!pairwiseTrials) return;
+  const trial = pairwiseTrials[trialIdx];
+  const isDraw = side === 'draw';
 
-  const filled = slots.filter(s => s.rank !== null);
-  if (filled.length < chunk.candidates.length) return; // not all filled yet
+  const body = isDraw
+    ? {
+        trial_idx: trial.trial_idx,
+        pair_id: trial.pair_id,
+        chunk_idx: trial.chunk_idx,
+        draw: true,
+        method_a: trial.left.method_hidden,
+        method_b: trial.right.method_hidden,
+      }
+    : {
+        trial_idx: trial.trial_idx,
+        pair_id: trial.pair_id,
+        chunk_idx: trial.chunk_idx,
+        draw: false,
+        winner_method: (side === 'left' ? trial.left : trial.right).method_hidden,
+        loser_method:  (side === 'left' ? trial.right : trial.left).method_hidden,
+      };
 
-  const body = { chunk_idx: humanChunkIdx, slots };
-
-  // All filled → auto-save (upserts on server)
   const res = await fetch('/api/human/rank', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
   });
-  const data = await res.json();
+  await res.json();
 
-  // Update local rankings cache
-  humanRankings[humanChunkIdx] = body;
+  const key = `${trial.pair_id}::${trial.chunk_idx}`;
+  pairwiseJudgments[key] = body;
 
-  const labeledCount = Object.keys(humanRankings).length;
+  const doneCount = Object.keys(pairwiseJudgments).length;
   document.getElementById('human-status').textContent =
-    `✓ Saved chunk ${humanChunkIdx + 1} (${labeledCount}/${humanChunks.length} ranked)`;
-  appendLog(`[human] Chunk ${humanChunkIdx + 1} ranked (saved)`);
+    `✓ Saved trial ${trialIdx + 1} (${doneCount}/${pairwiseTrials.length} done)`;
+  if (isDraw) {
+    appendLog(`[human] Trial ${trialIdx + 1}: draw (${trial.left.method_hidden} = ${trial.right.method_hidden})`);
+  } else {
+    const winner = side === 'left' ? trial.left : trial.right;
+    const loser  = side === 'left' ? trial.right : trial.left;
+    appendLog(`[human] Trial ${trialIdx + 1}: ${winner.label} wins (${winner.method_hidden} > ${loser.method_hidden})`);
+  }
 
-  // Update chunk indicator
-  const isRanked = true;
+  // Highlight selection
+  const leftCard = document.getElementById('pairwise-left');
+  const rightCard = document.getElementById('pairwise-right');
+  leftCard.classList.remove('pw-selected', 'pw-draw');
+  rightCard.classList.remove('pw-selected', 'pw-draw');
+  if (isDraw) {
+    leftCard.classList.add('pw-draw');
+    rightCard.classList.add('pw-draw');
+  } else if (side === 'left') {
+    leftCard.classList.add('pw-selected');
+  } else {
+    rightCard.classList.add('pw-selected');
+  }
+
+  // Update indicator
   document.getElementById('human-chunk-indicator').textContent =
-    `Chunk ${humanChunkIdx + 1} / ${humanChunks.length}` +
-    ` (${labeledCount} ranked) ✓`;
+    `Trial ${trialIdx + 1} / ${pairwiseTrials.length} (${doneCount} done) ✓`;
 
-  // Show saved indicator on each input
-  chunk.candidates.forEach(cand => {
-    const indicator = document.getElementById(`rank-saved-${cand.slot}`);
-    if (indicator) indicator.textContent = '✓';
-  });
+  // Auto-advance after short delay
+  setTimeout(() => {
+    if (trialIdx < pairwiseTrials.length - 1) {
+      trialIdx++;
+      renderTrial();
+    }
+  }, 400);
 }
 
-function prevHumanChunk() {
-  if (!humanChunks || humanChunkIdx === 0) return;
-  humanChunkIdx--; renderHumanChunk();
+function prevTrial() {
+  if (!pairwiseTrials || trialIdx === 0) return;
+  trialIdx--; renderTrial();
 }
-function nextHumanChunk() {
-  if (!humanChunks || humanChunkIdx >= humanChunks.length - 1) return;
-  humanChunkIdx++; renderHumanChunk();
+function nextTrial() {
+  if (!pairwiseTrials || trialIdx >= pairwiseTrials.length - 1) return;
+  trialIdx++; renderTrial();
 }
 
 async function finalizeHuman() {
   const res = await fetch('/api/human/finalize', { method: 'POST' });
   if (!res.ok) { appendLog('[human] Finalize failed: ' + await res.text(), true); return; }
   const data = await res.json();
-  appendLog(`[human] Pearson r=${data.pearson_r.toFixed(3)}  Spearman ρ=${data.spearman_rho.toFixed(3)}`);
+  const methods = data.methods || {};
+  for (const [m, r] of Object.entries(methods)) {
+    appendLog(`[human] ${m}: win_rate=${r.win_rate.toFixed(3)} [${r.ci_lo.toFixed(3)}, ${r.ci_hi.toFixed(3)}]`);
+  }
   await loadResults();
 }
 
@@ -684,7 +700,7 @@ async function loadResults() {
   const methods = data.methods || ['naive', 'split', 'split_compress', 'split_compress_io'];
   const sizes = data.mp4_sizes_mb || {};
   const judgeData = data.judge?.methods || {};
-  const humanRanks = data.human_eval?.mean_human_rank || {};
+  const humanWinRates = data.human_eval?.methods || {};
 
   // Table
   const tbody = document.getElementById('results-tbody');
@@ -693,25 +709,16 @@ async function loadResults() {
     const jd = judgeData[m] || {};
     const mean = jd.mean != null ? jd.mean.toFixed(2) : '–';
     const se = jd.bootstrap_se != null ? jd.bootstrap_se.toFixed(2) : '–';
-    const rank = humanRanks[m] != null ? humanRanks[m].toFixed(2) : '–';
+    const wr = humanWinRates[m];
+    const winRateStr = wr != null
+      ? `${(wr.win_rate * 100).toFixed(1)}% [${(wr.ci_lo * 100).toFixed(1)}, ${(wr.ci_hi * 100).toFixed(1)}]`
+      : '–';
     const sz = sizes[m] != null ? `${sizes[m]} MB` : '–';
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(m)}</td><td>${mean} ± ${se}</td><td>${rank}</td><td>${sz}</td>`;
+    tr.innerHTML = `<td>${escHtml(m)}</td><td>${mean} ± ${se}</td><td>${winRateStr}</td><td>${sz}</td>`;
     tbody.appendChild(tr);
   });
   document.getElementById('results-table-container').classList.remove('hidden');
-
-  // Correlation table
-  if (data.human_eval) {
-    const he = data.human_eval;
-    const nChunks = he.n_chunks != null ? ` (n=${he.n_chunks} chunks)` : '';
-    const cTbody = document.getElementById('corr-tbody');
-    cTbody.innerHTML = `
-      <tr><td>Pearson <em>r</em>${nChunks}</td><td>${he.pearson_r?.toFixed(3) ?? '–'}</td><td>${he.pearson_p?.toFixed(4) ?? '–'}</td></tr>
-      <tr><td>Spearman <em>ρ</em>${nChunks}</td><td>${he.spearman_rho?.toFixed(3) ?? '–'}</td><td>${he.spearman_p?.toFixed(4) ?? '–'}</td></tr>
-    `;
-    document.getElementById('correlation-container').classList.remove('hidden');
-  }
 }
 
 // ── Utilities ──────────────────────────────────────────────────────────────

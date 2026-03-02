@@ -530,14 +530,15 @@ async def run_judge(body: dict):
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Human evaluation
+# Step 5: Human evaluation  (pairwise comparisons)
 # ---------------------------------------------------------------------------
 
 @app.get("/api/human/chunks")
-async def get_human_chunks():
+async def get_human_chunks_pairwise(request: Request, n: int = 10):
     """
-    Return data for each GT chunk: GT captions, all 4 method captions
-    (shuffled / blinded), and the GT video clip path.
+    Build pairwise blind trials.
+
+    ?n=10  → sample 10 chunks per pair (6 pairs × 10 = 60 trials).
     """
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
@@ -545,25 +546,28 @@ async def get_human_chunks():
         raise HTTPException(status_code=400, detail="GT not done")
 
     import random as _random
+    from itertools import combinations
 
     session_dir = Path(_state.session_dir)
+    # Deterministic seed so reloading with the same session + n gives identical order
+    _seed = hash(str(session_dir.resolve()) + str(n)) & 0x7FFFFFFF
+    rng = _random.Random(_seed)
     gt_path = Path(_state.gt.gt_captions_path)
 
-    # Load GT chunks (groups of 8)
+    # ── Load GT chunks ──────────────────────────────────────────────────────
     gt_entries: List[Dict] = []
     with open(gt_path) as f:
         for line in f:
             if line.strip():
                 gt_entries.append(json.loads(line))
-    gt_chunks = [gt_entries[i:i+8] for i in range(0, len(gt_entries), 8)]
+    gt_chunks = [gt_entries[i:i + 8] for i in range(0, len(gt_entries), 8)]
+    num_chunks = len(gt_chunks)
 
-    # Load split_compress_io data.jsonl and ffmpeg start for time alignment
     from demo.single_judge import (
         _load_method_chunks, _chunk_captions_by_gt,
         _build_screenshot_time_map, _load_ffmpeg_start, _load_scio_data,
     )
 
-    # Build screenshot timestamp map
     screenshots_dir = None
     for candidate_dir in [
         session_dir / "napsack_session" / "screenshots",
@@ -573,230 +577,212 @@ async def get_human_chunks():
             screenshots_dir = candidate_dir
             break
     screenshot_timestamps = _build_screenshot_time_map(screenshots_dir) if screenshots_dir else []
-
     ffmpeg_start = _load_ffmpeg_start(session_dir)
     scio_data = _load_scio_data(session_dir)
 
-    # Build aligned method chunks
-    result_chunks = []
-    for ci, gt_chunk in enumerate(gt_chunks):
-        methods_data: Dict[str, List[Dict]] = {}
-        for m in METHODS:
-            raw = _load_method_chunks(session_dir, m)
-            flat = [c for chunk in raw for c in chunk]
-            aligned = _chunk_captions_by_gt(
-                flat, [gt_chunk], m, scio_data, screenshot_timestamps, ffmpeg_start,
-            )
-            methods_data[m] = aligned[0] if aligned else []
+    all_method_data: Dict[str, List[List[Dict]]] = {}
+    for m in METHODS:
+        raw = _load_method_chunks(session_dir, m)
+        flat = [c for chunk in raw for c in chunk]
+        aligned = _chunk_captions_by_gt(
+            flat, gt_chunks, m, scio_data, screenshot_timestamps, ffmpeg_start,
+        )
+        all_method_data[m] = aligned
 
-        # Shuffle method order for blind presentation
-        shuffled_methods = METHODS[:]
-        _random.shuffle(shuffled_methods)
-        candidates = [
-            {"slot": i + 1, "method_hidden": m, "captions": methods_data[m]}
-            for i, m in enumerate(shuffled_methods)
-        ]
+    gt_videos = _get_gt_videos(session_dir, gt_entries, 8)
 
-        # GT video
-        gt_videos = _get_gt_videos(session_dir, gt_entries, 8)
-        gt_video = gt_videos[ci] if ci < len(gt_videos) else None
+    # ── Generate trials ─────────────────────────────────────────────────────
+    pairs = list(combinations(METHODS, 2))  # 6 pairs
+    sample_n = min(n, num_chunks)
 
-        result_chunks.append({
-            "chunk_idx": ci,
-            "gt_captions": gt_chunk,
-            "candidates": candidates,
-            "gt_video": gt_video,
-        })
+    trials: List[Dict] = []
+    for m_a, m_b in pairs:
+        pair_id = f"{m_a}__{m_b}"
+        sampled = rng.sample(range(num_chunks), sample_n)
+        for ci in sampled:
+            # Randomly swap left/right for blind presentation
+            if rng.random() < 0.5:
+                left_m, right_m = m_a, m_b
+            else:
+                left_m, right_m = m_b, m_a
 
-    return JSONResponse({"chunks": result_chunks})
+            left_caps = all_method_data[left_m][ci] if ci < len(all_method_data[left_m]) else []
+            right_caps = all_method_data[right_m][ci] if ci < len(all_method_data[right_m]) else []
+
+            trials.append({
+                "trial_idx": len(trials),
+                "pair_id": pair_id,
+                "chunk_idx": ci,
+                "gt_captions": gt_chunks[ci],
+                "gt_video": gt_videos[ci] if ci < len(gt_videos) else None,
+                "left": {"label": "A", "method_hidden": left_m, "captions": left_caps},
+                "right": {"label": "B", "method_hidden": right_m, "captions": right_caps},
+            })
+
+    # Shuffle all trials
+    rng.shuffle(trials)
+    # Re-index after shuffle
+    for i, t in enumerate(trials):
+        t["trial_idx"] = i
+
+    return JSONResponse({"trials": trials, "n_per_pair": sample_n, "n_pairs": len(pairs)})
 
 
 @app.get("/api/human/rankings")
 async def get_human_rankings():
-    """Return existing human rankings from rankings.json."""
+    """Return existing pairwise judgments from pairwise.json."""
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
 
     session_dir = Path(_state.session_dir)
-    rankings_path = session_dir / "human_eval" / "rankings.json"
+    pw_path = session_dir / "human_eval" / "pairwise.json"
 
-    rankings: List[Dict] = []
-    if rankings_path.exists():
-        with open(rankings_path) as f:
-            rankings = json.load(f)
+    judgments: List[Dict] = []
+    if pw_path.exists():
+        with open(pw_path) as f:
+            judgments = json.load(f)
 
-    return JSONResponse({"rankings": rankings})
+    return JSONResponse({"judgments": judgments})
 
 
 @app.post("/api/human/rank")
 async def save_human_rank(body: dict):
-    """Save one chunk's rankings (upserts by chunk_idx)."""
+    """Save one pairwise judgment.
+
+    Body: { trial_idx, pair_id, chunk_idx, winner_method, loser_method }
+    Upserts by (pair_id, chunk_idx).
+    """
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
 
     session_dir = Path(_state.session_dir)
     hr_dir = session_dir / "human_eval"
     hr_dir.mkdir(exist_ok=True)
-    rankings_path = hr_dir / "rankings.json"
+    pw_path = hr_dir / "pairwise.json"
 
-    rankings: List[Dict] = []
-    if rankings_path.exists():
-        with open(rankings_path) as f:
-            rankings = json.load(f)
+    judgments: List[Dict] = []
+    if pw_path.exists():
+        with open(pw_path) as f:
+            judgments = json.load(f)
 
-    # Upsert: replace existing entry for same chunk_idx, or append new
-    chunk_idx = body.get("chunk_idx")
+    # Upsert by (pair_id, chunk_idx)
+    key = (body.get("pair_id"), body.get("chunk_idx"))
     existing_idx = next(
-        (i for i, r in enumerate(rankings) if r.get("chunk_idx") == chunk_idx),
+        (i for i, j in enumerate(judgments)
+         if (j.get("pair_id"), j.get("chunk_idx")) == key),
         None,
     )
     if existing_idx is not None:
-        rankings[existing_idx] = body
+        judgments[existing_idx] = body
     else:
-        rankings.append(body)
+        judgments.append(body)
 
-    with open(rankings_path, "w") as f:
-        json.dump(rankings, f, indent=2)
+    with open(pw_path, "w") as f:
+        json.dump(judgments, f, indent=2)
 
-    _state.human_eval.rankings_path = str(rankings_path)
+    _state.human_eval.rankings_path = str(pw_path)
     _state.save()
-    return JSONResponse({"status": "saved", "total": len(rankings)})
+    return JSONResponse({"status": "saved", "total": len(judgments)})
 
 
 @app.post("/api/human/finalize")
 async def finalize_human_eval():
-    """Compute Pearson r and Spearman ρ between human ranks and LLM scores.
-
-    Uses per-chunk within-chunk correlation, averaged across all chunks.
-    For each chunk that has all 4 methods rated by both human and LLM judge,
-    we compute the Spearman/Pearson correlation between the 4 human ranks
-    and the 4 (negated) LLM scores, then report the mean across chunks.
-
-    Human ranks: 1=best, 4=worst (lower is better).
-    LLM scores:  0=worst, 1=best (higher is better).
-    We negate LLM scores so both axes point the same direction; a positive
-    correlation means the human and LLM judge agree.
-    """
+    """Compute per-method win rate + 95 % CI (bootstrap) from pairwise judgments."""
     if _state.session_dir is None:
         raise HTTPException(status_code=400, detail="Set session_dir first")
-    if _state.judge.status != "done":
-        raise HTTPException(status_code=400, detail="LLM judge not done yet (step 4)")
 
     session_dir = Path(_state.session_dir)
     hr_dir = session_dir / "human_eval"
-    rankings_path = hr_dir / "rankings.json"
-    if not rankings_path.exists():
-        raise HTTPException(status_code=400, detail="No human rankings found")
+    pw_path = hr_dir / "pairwise.json"
+    if not pw_path.exists():
+        raise HTTPException(status_code=400, detail="No pairwise judgments found")
 
-    with open(rankings_path) as f:
-        rankings: List[Dict] = json.load(f)
+    with open(pw_path) as f:
+        judgments: List[Dict] = json.load(f)
 
-    # ── Load per-chunk LLM scores from judge run files ──────────────────────
-    import glob
-    judge_dir = session_dir / "judge"
-    run_files = sorted(glob.glob(str(judge_dir / "run_*.json")))
-    if not run_files:
-        raise HTTPException(status_code=400, detail="No judge run files found")
+    if not judgments:
+        raise HTTPException(status_code=400, detail="No judgments recorded")
 
-    # Average LLM score per (chunk_idx, method) across all runs
-    from collections import defaultdict
-    score_accum: Dict[tuple, List[float]] = defaultdict(list)
-    for rf in run_files:
-        with open(rf) as f:
-            run_data = json.load(f)
-        for ev in run_data.get("evaluations", []):
-            evaluation = ev.get("evaluation")
-            if evaluation and isinstance(evaluation, dict) and "score" in evaluation:
-                key = (ev["chunk_idx"], ev["method"])
-                score_accum[key].append(float(evaluation["score"]))
-
-    score_lookup: Dict[tuple, float] = {
-        k: sum(v) / len(v) for k, v in score_accum.items()
-    }
-
-    # ── Build per-chunk human rank lookup ───────────────────────────────────
-    rank_lookup: Dict[tuple, float] = {}
-    for entry in rankings:
-        ci = entry["chunk_idx"]
-        for slot in entry.get("slots", []):
-            m = slot.get("method")
-            r = slot.get("rank")
-            if m and r is not None:
-                rank_lookup[(ci, m)] = float(r)
-
-    # ── Per-chunk within-chunk correlation ──────────────────────────────────
-    from scipy.stats import pearsonr, spearmanr, ttest_1samp  # type: ignore
     import numpy as np
+    from collections import defaultdict
 
-    chunk_indices = sorted({ci for ci, _ in rank_lookup})
-    per_chunk_pearson: List[float] = []
-    per_chunk_spearman: List[float] = []
-
-    for ci in chunk_indices:
-        h_vec: List[float] = []
-        l_vec: List[float] = []
-        for m in METHODS:
-            rk = rank_lookup.get((ci, m))
-            sc = score_lookup.get((ci, m))
-            if rk is not None and sc is not None:
-                h_vec.append(rk)
-                # Negate so higher = worse, matching rank direction
-                l_vec.append(-sc)
-        # Need all 4 methods and non-constant vectors
-        if len(h_vec) < len(METHODS):
+    # Collect wins / appearances per method
+    wins: Dict[str, int] = defaultdict(int)
+    appearances: Dict[str, int] = defaultdict(int)
+    for j in judgments:
+        w = j.get("winner_method")
+        l = j.get("loser_method")
+        if not w or not l:
             continue
-        if len(set(h_vec)) < 2 or len(set(l_vec)) < 2:
-            continue
-        r_c, _ = pearsonr(h_vec, l_vec)
-        rho_c, _ = spearmanr(h_vec, l_vec)
-        per_chunk_pearson.append(float(r_c))
-        per_chunk_spearman.append(float(rho_c))
+        wins[w] += 1
+        appearances[w] += 1
+        appearances[l] += 1
 
-    n_chunks = len(per_chunk_pearson)
-    if n_chunks < 2:
-        raise HTTPException(status_code=400, detail="Not enough valid chunks for correlation")
+    # Bootstrap 95 % CI on win rate per method
+    n_boot = 10_000
+    rng = np.random.default_rng(42)
 
-    mean_pear = float(np.mean(per_chunk_pearson))
-    mean_spear = float(np.mean(per_chunk_spearman))
-    _, pval_pear = ttest_1samp(per_chunk_pearson, 0)
-    _, pval_spear = ttest_1samp(per_chunk_spearman, 0)
-
-    # ── Per-method summary stats (for display in results table) ─────────────
-    judge_summary = _state.judge.summary or {}
-    judge_methods = judge_summary.get("methods", {})
-
-    mean_human: Dict[str, float] = {}
+    method_results: Dict[str, Dict] = {}
     for m in METHODS:
-        vals = [rank_lookup[(ci, m)] for ci in chunk_indices if (ci, m) in rank_lookup]
-        mean_human[m] = float(sum(vals) / len(vals)) if vals else 0.0
+        # Gather per-judgment score: 1=win, 0.5=draw, 0=loss
+        indicators: List[float] = []
+        for j in judgments:
+            if j.get("draw"):
+                ma = j.get("method_a")
+                mb = j.get("method_b")
+                if m in (ma, mb):
+                    indicators.append(0.5)
+            else:
+                w = j.get("winner_method")
+                l = j.get("loser_method")
+                if m == w:
+                    indicators.append(1.0)
+                elif m == l:
+                    indicators.append(0.0)
+            # else: this judgment doesn't involve m
+        n_total = len(indicators)
+        if n_total == 0:
+            method_results[m] = {
+                "win_rate": 0.0, "ci_lo": 0.0, "ci_hi": 0.0, "n": 0,
+            }
+            continue
+        arr = np.array(indicators, dtype=float)
+        win_rate = float(arr.mean())
 
-    mean_llm: Dict[str, float] = {
-        m: judge_methods.get(m, {}).get("mean", 0.0) for m in METHODS
+        # Bootstrap
+        boot_means = np.empty(n_boot)
+        for b in range(n_boot):
+            sample = rng.choice(arr, size=n_total, replace=True)
+            boot_means[b] = sample.mean()
+        ci_lo = float(np.percentile(boot_means, 2.5))
+        ci_hi = float(np.percentile(boot_means, 97.5))
+
+        method_results[m] = {
+            "win_rate": win_rate,
+            "ci_lo": ci_lo,
+            "ci_hi": ci_hi,
+            "n": n_total,
+        }
+
+    results = {
+        "methods": method_results,
+        "total_judgments": len(judgments),
     }
 
-    correlations = {
-        "pearson_r": mean_pear,
-        "pearson_p": float(pval_pear),
-        "spearman_rho": mean_spear,
-        "spearman_p": float(pval_spear),
-        "n_chunks": n_chunks,
-        "mean_human_rank": mean_human,
-        "mean_llm_score": mean_llm,
-    }
+    results_path = hr_dir / "win_rates.json"
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
 
-    corr_path = hr_dir / "correlations.json"
-    with open(corr_path, "w") as f:
-        json.dump(correlations, f, indent=2)
-
-    _state.human_eval.correlations_path = str(corr_path)
-    _state.human_eval.correlations = correlations
+    _state.human_eval.results_path = str(results_path)
+    _state.human_eval.results = results
     _state.human_eval.status = "done"
     _state.save()
 
-    _log(f"[human_eval] Per-chunk correlation (n={n_chunks}): "
-         f"Pearson r={mean_pear:.3f} (p={pval_pear:.4f})  "
-         f"Spearman ρ={mean_spear:.3f} (p={pval_spear:.4f})")
-    return JSONResponse(correlations)
+    for m in METHODS:
+        r = method_results[m]
+        _log(f"[human_eval] {m}: win_rate={r['win_rate']:.3f} "
+             f"[{r['ci_lo']:.3f}, {r['ci_hi']:.3f}] (n={r['n']})")
+    return JSONResponse(results)
 
 
 # ---------------------------------------------------------------------------
@@ -810,7 +796,7 @@ async def get_results():
         "methods": METHODS,
         "mp4_sizes_mb": _state.processing.mp4_sizes_mb,
         "judge": _state.judge.summary,
-        "human_eval": _state.human_eval.correlations,
+        "human_eval": _state.human_eval.results,
         "gemini_key_ok": bool(os.environ.get("GEMINI_API_KEY", "")),
     }
     return JSONResponse(d)

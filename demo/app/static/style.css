@@ -689,16 +689,16 @@ input[type="number"]:focus {
   color: var(--text-dim);
 }
 
-/* ── Human Evaluation (Step 5) ─────────────────────────────────────────── */
-.human-split {
+/* ── Human Evaluation – Pairwise (Step 5) ──────────────────────────────── */
+.pairwise-layout {
   display: grid;
-  grid-template-columns: 1fr 3fr;
+  grid-template-columns: 1fr 2fr;
   gap: 16px;
   margin-top: 14px;
 }
 
-.human-gt h4,
-.human-candidates h4 {
+.pairwise-gt h4,
+.pairwise-candidates h4 {
   margin-bottom: 8px;
   color: var(--text-secondary);
 }
@@ -718,60 +718,62 @@ input[type="number"]:focus {
   margin: 4px 0;
 }
 
-.human-candidates {
+.pairwise-candidates {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr auto 1fr;
   gap: 12px;
+  align-items: start;
 }
 
-.candidate-card {
+.pairwise-draw {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-top: 32px;
+}
+
+.btn-draw {
+  background: var(--bg2);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  min-width: 64px;
+}
+
+.btn-draw:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.pairwise-card.pw-draw {
+  border-color: var(--text-secondary);
+  box-shadow: 0 0 0 2px rgba(128, 128, 128, 0.2);
+}
+
+.pairwise-card {
   background: var(--bg);
-  border: 1px solid var(--border-light);
+  border: 2px solid var(--border-light);
   border-radius: var(--radius-sm);
   padding: 12px;
-  transition: border-color .15s;
+  transition: border-color .15s, box-shadow .15s;
 }
 
-.candidate-card:hover {
+.pairwise-card:hover {
   border-color: var(--accent);
 }
 
-.candidate-card h4 {
+.pairwise-card.pw-selected {
+  border-color: var(--green);
+  box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.25);
+}
+
+.pairwise-card h4 {
   margin-bottom: 6px;
   font-size: .88rem;
 }
 
-.rank-input {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-}
-
-.rank-input label {
-  font-size: .84rem;
-  color: var(--text-secondary);
-}
-
-.rank-input input {
-  width: 55px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  color: var(--text);
-  padding: 5px 8px;
-  font-size: .88rem;
-}
-
-.rank-input input:focus {
-  border-color: var(--accent);
-  outline: none;
-}
-
-.rank-saved {
-  color: var(--green);
-  font-size: .78rem;
-  font-weight: 600;
+.pw-pick-btn {
+  margin-top: 10px;
+  width: 100%;
 }
 
 /* ── Results table ─────────────────────────────────────────────────────── */
@@ -860,11 +862,11 @@ tr:hover td {
     grid-template-columns: 1fr;
   }
 
-  .human-split {
+  .pairwise-layout {
     grid-template-columns: 1fr;
   }
 
-  .human-candidates {
+  .pairwise-candidates {
     grid-template-columns: 1fr;
   }
 }

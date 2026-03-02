@@ -193,17 +193,23 @@
           </div>          <p id="judge-status" class="status-text"></p>
         </section>
 
-        <!-- Step 5: Human Evaluation -->
+        <!-- Step 5: Human Evaluation (pairwise) -->
         <section class="canvas hidden" id="canvas-5">
-          <h2>👤 Step 5 – Human Evaluation</h2>
-          <p>Rank the four method outputs (blinded) for each GT chunk. Rankings auto-save when all 4 ranks are filled.</p>
-          <button class="btn" onclick="loadHumanChunks()">Load Chunks for Ranking</button>
+          <h2>👤 Step 5 – Human Evaluation (Pairwise)</h2>
+          <p>For each pair of methods, compare blinded candidates side-by-side and pick the better one.</p>
+          <div class="row" style="align-items:center;gap:12px">
+            <label>Samples per pair:
+              <input id="human-n-samples" type="number" value="10" min="1" max="100" style="width:60px"
+                     title="Number of GT chunks sampled per method pair (6 pairs → 6×N total comparisons)"/>
+            </label>
+            <button class="btn" onclick="loadPairwiseTrials()">Load Pairwise Trials</button>
+          </div>
 
           <div id="human-eval-ui" class="hidden">
-            <div class="gt-chunk-nav">
-              <button class="btn btn-sm" onclick="prevHumanChunk()">← Prev</button>
-              <span id="human-chunk-indicator">Chunk 1 / ?</span>
-              <button class="btn btn-sm" onclick="nextHumanChunk()">Next →</button>
+            <div class="gt-chunk-nav" style="margin-bottom:8px">
+              <button class="btn btn-sm" onclick="prevTrial()">← Prev</button>
+              <span id="human-chunk-indicator">Trial 1 / ?</span>
+              <button class="btn btn-sm" onclick="nextTrial()">Next →</button>
             </div>
 
             <div id="human-gt-video-container" class="hidden" style="margin-bottom:12px">
@@ -211,19 +217,33 @@
               <video id="human-gt-video" controls style="max-width:400px;border-radius:6px;"></video>
             </div>
 
-            <div class="human-split">
-              <div class="human-gt">
+            <div class="pairwise-layout">
+              <div class="pairwise-gt">
                 <h4>Ground Truth</h4>
                 <div id="human-gt-captions" class="caption-list"></div>
               </div>
-              <div class="human-candidates" id="human-candidates-panel"></div>
+              <div class="pairwise-candidates">
+                <div class="pairwise-card" id="pairwise-left">
+                  <h4>Candidate A</h4>
+                  <div class="caption-list" id="pw-left-captions"></div>
+                  <button class="btn btn-green pw-pick-btn" id="pw-pick-left" onclick="pickWinner('left')">✓ A is better</button>
+                </div>
+                <div class="pairwise-draw">
+                  <button class="btn btn-draw pw-pick-btn" id="pw-pick-draw" onclick="pickWinner('draw')">≈ Draw</button>
+                </div>
+                <div class="pairwise-card" id="pairwise-right">
+                  <h4>Candidate B</h4>
+                  <div class="caption-list" id="pw-right-captions"></div>
+                  <button class="btn btn-green pw-pick-btn" id="pw-pick-right" onclick="pickWinner('right')">✓ B is better</button>
+                </div>
+              </div>
             </div>
 
             <p id="human-status" class="status-text"></p>
           </div>
 
           <div style="margin-top:16px">
-            <button class="btn" onclick="finalizeHuman()">📊 Compute Correlations</button>
+            <button class="btn" onclick="finalizeHuman()">📊 Compute Win Rates</button>
           </div>
         </section>
 
@@ -242,19 +262,11 @@
               <tr>
                 <th>Method</th>
                 <th>Judge Score (↑)</th>
-                <th>Avg Rank (↓)</th>
+                <th>Win Rate (↑)</th>
                 <th>Size (↓)</th>
               </tr>
             </thead>
             <tbody id="results-tbody"></tbody>
-          </table>
-        </div>
-
-        <div id="correlation-container" class="hidden" style="margin-top:16px">
-          <h3>Human vs LLM Correlation</h3>
-          <table id="corr-table">
-            <thead><tr><th>Metric</th><th>Value</th><th><em>p</em>-value</th></tr></thead>
-            <tbody id="corr-tbody"></tbody>
           </table>
         </div>
       </section>
